@@ -1,16 +1,11 @@
 import { NextResponse } from 'next/server'
+import { gunzipSync } from 'node:zlib'
 
 const API_V2 = 'https://api.upstox.com/v2'
 const API_V3 = 'https://api.upstox.com/v3'
-
-const stockQueries = [
-  ['BEL', 'Bharat Electronics', 'Defence'],
-  ['TRENT', 'Trent Ltd', 'Retail'],
-  ['BHEL', 'Bharat Heavy Electricals', 'Capital Goods'],
-  ['HAL', 'Hindustan Aeronautics', 'Defence'],
-  ['TATASTEEL', 'Tata Steel', 'Metals'],
-  ['ADANIENT', 'Adani Enterprises', 'Conglomerate'],
-] as const
+const UPSTOX_NSE_INSTRUMENTS = 'https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz'
+const MAX_TECHNICAL_SCAN = 80
+const TOP_RESULTS = 25
 
 const indexQueries = [
   ['NIFTY 50', 'NIFTY 50'],
@@ -24,6 +19,11 @@ type Instrument = {
   trading_symbol?: string
   name?: string
   segment?: string
+  instrument_type?: string
+  underlying_symbol?: string
+  underlying_key?: string
+  underlying_type?: string
+  expiry?: number | string
 }
 
 type Quote = {
@@ -58,8 +58,42 @@ function indiaDate(offsetDays = 0) {
   const y = Number(parts.find(p => p.type === 'year')?.value)
   const m = Number(parts.find(p => p.type === 'month')?.value)
   const d = Number(parts.find(p => p.type === 'day')?.value)
-  const date = new Date(Date.UTC(y, m - 1, d + offsetDays))
-  return date.toISOString().slice(0, 10)
+  return new Date(Date.UTC(y, m - 1, d + offsetDays)).toISOString().slice(0, 10)
+}
+
+async function getNseFnoUniverse(token: string) {
+  const response = await fetch(UPSTOX_NSE_INSTRUMENTS, { cache: 'no-store' })
+  if (!response.ok) throw new Error(`Upstox instrument master failed: ${response.status}`)
+  const compressed = Buffer.from(await response.arrayBuffer())
+  const instruments = JSON.parse(gunzipSync(compressed).toString('utf8')) as Instrument[]
+
+  const now = Date.now()
+  const futureStockFutures = instruments.filter(item =>
+    item.segment === 'NSE_FO' &&
+    item.instrument_type === 'FUT' &&
+    item.underlying_type === 'EQUITY' &&
+    item.underlying_key &&
+    item.underlying_symbol &&
+    Number(item.expiry) >= now - 24 * 60 * 60 * 1000
+  )
+
+  const expiries = futureStockFutures
+    .map(x => Number(x.expiry))
+    .filter(Number.isFinite)
+    .sort((a, b) => a - b)
+
+  const nearestExpiry = expiries[0]
+  const currentContracts = futureStockFutures.filter(x => Number(x.expiry) === nearestExpiry)
+  const unique = new Map<string, Instrument>()
+  for (const item of currentContracts) {
+    const symbol = item.underlying_symbol!.toUpperCase()
+    if (!unique.has(symbol)) unique.set(symbol, item)
+  }
+
+  return {
+    stocks: Array.from(unique.values()),
+    expiry: nearestExpiry ? new Date(nearestExpiry).toISOString().slice(0, 10) : null,
+  }
 }
 
 async function searchInstrument(query: string, segment: 'EQ' | 'INDEX', token: string) {
@@ -83,23 +117,27 @@ async function searchInstrument(query: string, segment: 'EQ' | 'INDEX', token: s
 
 async function getQuotes(keys: string[], token: string) {
   if (!keys.length) return {} as Record<string, Quote>
-  const url = new URL(`${API_V2}/market-quote/quotes`)
-  url.searchParams.set('instrument_key', keys.join(','))
-  const response = await fetch(url, {
-    headers: { Accept: 'application/json', Authorization: `Bearer ${token}` },
-    cache: 'no-store',
-  })
-  if (!response.ok) throw new Error(`Market quote failed: ${response.status}`)
-  const body = await response.json()
-  const rawData = (body.data ?? {}) as Record<string, Quote>
-  const quotes: Record<string, Quote> = {}
-  for (const [returnedKey, quote] of Object.entries(rawData)) {
-    const normalized = normalizeInstrumentKey(returnedKey)
-    if (normalized) quotes[normalized] = quote
-    const tokenKey = normalizeInstrumentKey(quote.instrument_token)
-    if (tokenKey) quotes[tokenKey] = quote
+  const chunks: string[][] = []
+  for (let i = 0; i < keys.length; i += 500) chunks.push(keys.slice(i, i + 500))
+  const all: Record<string, Quote> = {}
+  for (const chunk of chunks) {
+    const url = new URL(`${API_V2}/market-quote/quotes`)
+    url.searchParams.set('instrument_key', chunk.join(','))
+    const response = await fetch(url, {
+      headers: { Accept: 'application/json', Authorization: `Bearer ${token}` },
+      cache: 'no-store',
+    })
+    if (!response.ok) throw new Error(`Market quote failed: ${response.status}`)
+    const body = await response.json()
+    const rawData = (body.data ?? {}) as Record<string, Quote>
+    for (const [returnedKey, quote] of Object.entries(rawData)) {
+      const normalized = normalizeInstrumentKey(returnedKey)
+      if (normalized) all[normalized] = quote
+      const tokenKey = normalizeInstrumentKey(quote.instrument_token)
+      if (tokenKey) all[tokenKey] = quote
+    }
   }
-  return quotes
+  return all
 }
 
 async function getDailyCandles(instrumentKey: string, token: string): Promise<Candle[]> {
@@ -160,8 +198,8 @@ function analyzeT1(candlesRaw: Candle[]) {
   const rangeExpansion = avgRange ? range / avgRange : 1
   const closeLocation = range ? (close - low) / range : 0.5
   const bodyPct = range ? Math.abs(close - open) / range : 0
-  const momentum5 = candles.length > 5 && Number(candles[i - 5][4]) ? ((close / Number(candles[i - 5][4])) - 1) * 100 : 0
-  const momentum20 = candles.length > 20 && Number(candles[i - 20][4]) ? ((close / Number(candles[i - 20][4])) - 1) * 100 : 0
+  const momentum5 = Number(candles[i - 5][4]) ? ((close / Number(candles[i - 5][4])) - 1) * 100 : 0
+  const momentum20 = Number(candles[i - 20][4]) ? ((close / Number(candles[i - 20][4])) - 1) * 100 : 0
   const high20 = Math.max(...candles.slice(Math.max(0, i - 20), i).map(x => Number(x[2])))
   const low20 = Math.min(...candles.slice(Math.max(0, i - 20), i).map(x => Number(x[3])))
   const breakoutUp = close > high20
@@ -199,21 +237,12 @@ function analyzeT1(candlesRaw: Candle[]) {
   const confidence = score >= 90 ? 'A+' : score >= 80 ? 'A' : score >= 70 ? 'B+' : 'B'
 
   return {
-    score,
-    bias,
-    change: dayChange,
+    score, bias, change: dayChange,
     volume: volume ? volume.toLocaleString('en-IN') : '—',
     rs: bias === 'LONG' ? (momentum5 > 1 ? 'Strong' : 'Positive') : (momentum5 < -1 ? 'Weak' : 'Negative'),
-    setup,
-    confidence,
-    lastPrice: close,
-    oi: null,
-    rvol: Number(rvol.toFixed(2)),
-    rangePct: Number(rangePct.toFixed(2)),
-    nr4,
-    nr7,
-    pdBreak: breakoutUp ? 'PDH' : breakoutDown ? 'PDL' : '—',
-    t1Date: c[0],
+    setup, confidence, lastPrice: close, oi: null,
+    rvol: Number(rvol.toFixed(2)), rangePct: Number(rangePct.toFixed(2)), nr4, nr7,
+    pdBreak: breakoutUp ? 'PDH' : breakoutDown ? 'PDL' : '—', t1Date: c[0],
   }
 }
 
@@ -222,35 +251,53 @@ export async function GET() {
   if (!token) return NextResponse.json({ ok: false, error: 'UPSTOX_ANALYTICS_TOKEN is not configured' }, { status: 500 })
 
   try {
-    const [stocks, indexes] = await Promise.all([
-      Promise.all(stockQueries.map(async ([query, name, sector]) => ({
-        query, name, sector, instrument: await searchInstrument(query, 'EQ', token)
-      }))),
+    const [{ stocks: fnoStocks, expiry }, indexes] = await Promise.all([
+      getNseFnoUniverse(token),
       Promise.all(indexQueries.map(async ([query, label]) => ({
         query, label, instrument: await searchInstrument(query, 'INDEX', token)
       }))),
     ])
 
-    const stockKeys = stocks.map(x => x.instrument?.instrument_key).filter(Boolean) as string[]
+    // The universe is dynamic: every NSE stock with a live stock-futures contract.
+    // First rank the full F&O universe by traded value, then run the heavier T-1
+    // historical calculation on the most liquid names so the server remains fast.
+    const stockKeys = fnoStocks.map(x => x.underlying_key!).filter(Boolean)
     const indexKeys = indexes.map(x => x.instrument?.instrument_key).filter(Boolean) as string[]
     const quotes = await getQuotes([...stockKeys, ...indexKeys], token)
 
-    const analyzed = await Promise.all(stocks.map(async (item, index) => {
-      const key = item.instrument?.instrument_key
-      if (!key) return null
-      const candles = await getDailyCandles(key, token)
-      const t1 = analyzeT1(candles)
-      if (!t1) return null
-      return {
-        rank: index + 1,
-        symbol: item.query,
-        name: item.name,
-        sector: item.sector,
-        ...t1,
+    const liquidStocks = fnoStocks
+      .map(item => {
+        const key = normalizeInstrumentKey(item.underlying_key)
+        const quote = quotes[key]
+        const last = Number(quote?.last_price ?? 0)
+        const volume = Number(quote?.volume ?? 0)
+        return { item, key, quote, liquidity: last * volume }
+      })
+      .sort((a, b) => b.liquidity - a.liquidity)
+      .slice(0, MAX_TECHNICAL_SCAN)
+
+    const analyzed = await Promise.all(liquidStocks.map(async ({ item, key, quote }) => {
+      try {
+        const candles = await getDailyCandles(key, token)
+        const t1 = analyzeT1(candles)
+        if (!t1) return null
+        return {
+          symbol: item.underlying_symbol!,
+          name: item.name || item.underlying_symbol!,
+          sector: 'F&O',
+          ...t1,
+          quoteVolume: Number(quote?.volume ?? 0),
+        }
+      } catch {
+        return null
       }
     }))
 
-    const candidates = analyzed.filter(Boolean).sort((a: any, b: any) => b.score - a.score).map((c: any, index) => ({ ...c, rank: index + 1 }))
+    const candidates = analyzed
+      .filter(Boolean)
+      .sort((a: any, b: any) => b.score - a.score)
+      .slice(0, TOP_RESULTS)
+      .map((c: any, index) => ({ ...c, rank: index + 1 }))
 
     const indexData = indexes.map(item => {
       const key = normalizeInstrumentKey(item.instrument?.instrument_key)
@@ -263,8 +310,11 @@ export async function GET() {
 
     return NextResponse.json({
       ok: true,
-      source: 'Upstox Analytics Token + Historical T-1 Engine',
+      source: 'Upstox NSE F&O universe + T-1 technical engine',
       timestamp: new Date().toISOString(),
+      fnoUniverseCount: fnoStocks.length,
+      technicalScanCount: liquidStocks.length,
+      expiry,
       candidates,
       indexes: indexData,
     }, { headers: { 'Cache-Control': 'no-store' } })
