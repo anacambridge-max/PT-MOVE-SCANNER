@@ -84,7 +84,8 @@ export default function Home() {
   const shortCount = candidates.filter(c => c.bias === 'SHORT').length
   const extremeCount = candidates.filter(c => c.extremeVolume).length
   const orbCount = candidates.filter(c => c.openingRangeBreak).length
-  const regime = diagnostics.marketDirection === 'LONG' ? 'BULLISH' : diagnostics.marketDirection === 'SHORT' ? 'BEARISH' : longCount >= shortCount ? 'BULLISH' : 'NEUTRAL'
+  const marketDirection = diagnostics?.marketDirection
+  const regime = marketDirection === 'LONG' ? 'BULLISH' : marketDirection === 'SHORT' ? 'BEARISH' : longCount >= shortCount ? 'BULLISH' : 'NEUTRAL'
 
   return (
     <main className="shell">
