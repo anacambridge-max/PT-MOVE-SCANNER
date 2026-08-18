@@ -13,22 +13,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Fix TypeScript boolean narrowing
+      - name: Fix PDH PDL extreme-volume historical filter
         run: |
           python - <<'PY'
           from pathlib import Path
-          p = Path('app/page.tsx')
+          p = Path('app/api/historical/route.ts')
           s = p.read_text()
-          old = "good={pattern.top.dailyLocation?.includes('BASE')}"
-          new = "good={!!pattern.top.dailyLocation?.includes('BASE')}"
-          if old not in s:
-              raise SystemExit('Target expression not found')
-          p.write_text(s.replace(old, new, 1))
+
+          s2 = s.replace("const MAX_SCAN=200,CONCURRENCY=2,TOP=30", "const MAX_SCAN=500,CONCURRENCY=3,TOP=30")
+          s2 = s2.replace("h=+c[2],lo=+c[3],cl=+c[4],pdh=h>prev.high,pdl=lo<prev.low", "h=+c[2],lo=+c[3],cl=+c[4],pdh=cl>prev.high,pdl=cl<prev.low")
+          s2 = s2.replace("if(!f||f.dailyHigh<=50)return null;", "if(!f)return null;")
+
+          if s2 == s:
+              raise SystemExit('Historical filter targets not found or already fixed')
+          p.write_text(s2)
           PY
-      - name: Commit fix
+      - name: Commit filter fix
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add app/page.tsx
-          git commit -m "Fix dashboard TypeScript boolean type"
+          git add app/api/historical/route.ts
+          git commit -m "Require close-confirmed PDH PDL break with extreme volume"
           git push
