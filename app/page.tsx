@@ -16,6 +16,12 @@ type Candidate = {
   confidence: string
   lastPrice: number
   oi: number | null
+  rvol?: number
+  rangePct?: number
+  nr4?: boolean
+  nr7?: boolean
+  pdBreak?: string
+  t1Date?: string
 }
 
 type IndexQuote = { title: string; value: number | null; change: number | null }
@@ -67,6 +73,7 @@ export default function Home() {
   const aPlus = candidates.filter(c => c.score >= 90).length
   const longCount = candidates.filter(c => c.bias === 'LONG').length
   const regime = candidates.length > 0 && longCount >= candidates.length / 2 ? 'BULLISH' : 'BEARISH'
+  const t1Date = candidates.find(c => c.t1Date)?.t1Date
 
   return (
     <main className="shell">
@@ -84,11 +91,11 @@ export default function Home() {
 
       <section className="hero">
         <div>
-          <div className="eyebrow">PRE-MARKET INTELLIGENCE TERMINAL</div>
+          <div className="eyebrow">T-1 PRE-MARKET INTELLIGENCE TERMINAL</div>
           <h1>Find the stocks <span>before the move.</span></h1>
-          <p>Live Upstox market data is now connected. The scoring layer is still a first-stage prototype and will be replaced with the full T-1 / pre-market / live model next.</p>
+          <p>Real Upstox data is connected. The T-1 engine now scores the previous completed session using trend, momentum, range expansion, relative volume, NR4/NR7 and PDH/PDL structure.</p>
         </div>
-        <div className="regime-card"><div className="small-label">MARKET REGIME</div><div className="regime">{regime} <b>{regime === 'BULLISH' ? '↑' : '↓'}</b></div><div className="muted">Based on current candidate direction</div></div>
+        <div className="regime-card"><div className="small-label">MARKET REGIME</div><div className="regime">{regime} <b>{regime === 'BULLISH' ? '↑' : '↓'}</b></div><div className="muted">Based on T-1 candidate direction</div></div>
       </section>
 
       <section className="index-grid">
@@ -105,27 +112,27 @@ export default function Home() {
       </section>
 
       <section className="stats-row">
-        <Stat label="T-1 CANDIDATES" value={String(candidates.length)} note="Current connected universe" />
-        <Stat label="PRE-MARKET CONFIRMED" value="—" note="Full early filter coming next" />
+        <Stat label="T-1 CANDIDATES" value={String(candidates.length)} note={t1Date ? `Using session ${new Date(t1Date).toLocaleDateString('en-IN')}` : 'Historical structure scan'} />
+        <Stat label="PRE-MARKET CONFIRMED" value="—" note="Gap + sector + derivatives layer next" />
         <Stat label="LIVE CONFIRMATIONS" value={String(candidates.length)} note="Live quote layer connected" />
-        <Stat label="A+ SETUPS" value={String(aPlus)} note="Prototype score 90 or above" />
+        <Stat label="A+ SETUPS" value={String(aPlus)} note="T-1 score 90 or above" />
       </section>
 
       <section className="content-grid">
         <div className="panel candidates-panel">
-          <div className="panel-head"><div><div className="panel-title">TOP MOVE CANDIDATES</div><div className="panel-sub">{mode === 'T-1' ? 'Current market snapshot; T-1 engine comes next' : mode === 'PRE-MARKET' ? 'Early-session confirmation layer' : 'Live confirmation layer'}</div></div><span className="live-pill"><i /> {loading ? 'CONNECTING' : error ? 'ERROR' : 'LIVE'}</span></div>
-          <div className="table-wrap"><table><thead><tr><th>#</th><th>STOCK</th><th>SCORE</th><th>BIAS</th><th>CHANGE</th><th>VOLUME</th><th>REL. STRENGTH</th><th>SETUP</th></tr></thead><tbody>{filtered.map(c => <tr key={c.symbol}><td className="rank">{String(c.rank).padStart(2,'0')}</td><td><div className="stock"><strong>{c.symbol}</strong><span>{c.name}</span></div></td><td><Score value={c.score} /></td><td><span className={`bias ${c.bias.toLowerCase()}`}>{c.bias === 'LONG' ? '↑' : '↓'} {c.bias}</span></td><td className={c.change >= 0 ? 'up' : 'down'}>{c.change > 0 ? '+' : ''}{c.change.toFixed(2)}%</td><td className="volume">{c.volume}</td><td>{c.rs}</td><td><span className="setup">{c.setup}</span></td></tr>)}{!loading && !filtered.length && <tr><td colSpan={8} style={{padding:'28px', textAlign:'center'}}>{error || 'No matching live instruments.'}</td></tr>}</tbody></table></div>
+          <div className="panel-head"><div><div className="panel-title">TOP MOVE CANDIDATES</div><div className="panel-sub">{mode === 'T-1' ? 'Previous-session structure ranked for the next trading session' : mode === 'PRE-MARKET' ? 'Early-session confirmation layer — coming next' : 'Live confirmation layer — coming next'}</div></div><span className="live-pill"><i /> {loading ? 'CONNECTING' : error ? 'ERROR' : 'T-1 LIVE'}</span></div>
+          <div className="table-wrap"><table><thead><tr><th>#</th><th>STOCK</th><th>SCORE</th><th>BIAS</th><th>T-1 CHG</th><th>VOLUME</th><th>REL. STRENGTH</th><th>SETUP</th></tr></thead><tbody>{filtered.map(c => <tr key={c.symbol}><td className="rank">{String(c.rank).padStart(2,'0')}</td><td><div className="stock"><strong>{c.symbol}</strong><span>{c.name}</span></div></td><td><Score value={c.score} /></td><td><span className={`bias ${c.bias.toLowerCase()}`}>{c.bias === 'LONG' ? '↑' : '↓'} {c.bias}</span></td><td className={c.change >= 0 ? 'up' : 'down'}>{c.change > 0 ? '+' : ''}{c.change.toFixed(2)}%</td><td className="volume">{c.volume}</td><td>{c.rs}</td><td><span className="setup">{c.setup}</span></td></tr>)}{!loading && !filtered.length && <tr><td colSpan={8} style={{padding:'28px', textAlign:'center'}}>{error || 'No matching T-1 candidates.'}</td></tr>}</tbody></table></div>
         </div>
 
-        <aside className="panel sector-panel"><div className="panel-head"><div><div className="panel-title">SECTOR LEADERSHIP</div><div className="panel-sub">First-stage proxy from connected candidates</div></div></div>{sectorRows(candidates).map(([name, score, move]) => <div className="sector" key={name}><div className="sector-top"><span>{name}</span><b>{move}</b></div><div className="bar"><i style={{width: `${score}%`}} /></div><div className="sector-foot"><span>RS proxy</span><span>{score}</span></div></div>)}</aside>
+        <aside className="panel sector-panel"><div className="panel-head"><div><div className="panel-title">SECTOR LEADERSHIP</div><div className="panel-sub">T-1 average move across scanned candidates</div></div></div>{sectorRows(candidates).map(([name, score, move]) => <div className="sector" key={name}><div className="sector-top"><span>{name}</span><b>{move}</b></div><div className="bar"><i style={{width: `${score}%`}} /></div><div className="sector-foot"><span>T-1 RS proxy</span><span>{score}</span></div></div>)}</aside>
       </section>
 
       <section className="bottom-grid">
-        <div className="panel signal-panel"><div className="panel-title">SCANNER LOGIC — BUILD ROADMAP</div><div className="logic-grid"><Logic n="01" title="Live Market Data" text="Upstox quotes, price, volume and index data connected" /><Logic n="02" title="T-1 Engine" text="Previous-session structure, range, volume and volatility" /><Logic n="03" title="Pre-Market Engine" text="Gap, sector, index and derivatives confirmation" /><Logic n="04" title="F&O / OI Layer" text="PCR, OI, change in OI and max-pain signals next" /></div></div>
-        <div className="panel disclaimer"><div className="panel-title">MODEL STATUS</div><div className="status-line"><span className="dot" /> {error ? 'Connection error' : 'Upstox connector active'}</div><p>{error ? error : 'Real Upstox market data is connected. Current score is a first-stage momentum proxy, not the final PT model.'}</p><div className="progress"><i style={{width: '35%'}} /></div><div className="muted">Data connector: {error ? 'ERROR' : 'UPSTOX LIVE'}</div></div>
+        <div className="panel signal-panel"><div className="panel-title">SCANNER LOGIC — BUILD ROADMAP</div><div className="logic-grid"><Logic n="01" title="Live Market Data" text="Upstox quotes, price, volume and index data connected" /><Logic n="02" title="T-1 Engine — ACTIVE" text="Trend, 5/20 momentum, range, RVOL, NR4/NR7 and PDH/PDL structure" /><Logic n="03" title="Pre-Market Engine" text="Gap, sector, index and derivatives confirmation — next layer" /><Logic n="04" title="F&O / OI Layer" text="PCR, OI, change in OI and max-pain signals — next layer" /></div></div>
+        <div className="panel disclaimer"><div className="panel-title">MODEL STATUS</div><div className="status-line"><span className="dot" /> {error ? 'Connection error' : 'Upstox T-1 engine active'}</div><p>{error ? error : 'T-1 candidates are now generated from completed daily candles rather than raw current-day momentum. This is still a research model, not investment advice.'}</p><div className="progress"><i style={{width: '55%'}} /></div><div className="muted">Data connector: {error ? 'ERROR' : 'UPSTOX LIVE + HISTORICAL'}</div></div>
       </section>
 
-      <footer><span>PT MOVE SCANNER • v1.1</span><span>Built for research & decision support • Not investment advice</span></footer>
+      <footer><span>PT MOVE SCANNER • v1.2 T-1 ENGINE</span><span>Built for research & decision support • Not investment advice</span></footer>
     </main>
   )
 }
