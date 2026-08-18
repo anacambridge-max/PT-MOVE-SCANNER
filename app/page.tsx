@@ -133,7 +133,7 @@ export default function Home() {
 function sectorRows(candidates: Candidate[]): [string, number, string][] {
   const groups = new Map<string, number[]>()
   candidates.forEach(c => groups.set(c.sector, [...(groups.get(c.sector) ?? []), c.change]))
-  return [...groups.entries()]
+  return Array.from(groups.entries())
     .map(([name, changes]) => {
       const avg = changes.reduce((a, b) => a + b, 0) / changes.length
       const score = Math.max(10, Math.min(99, Math.round(50 + avg * 12)))
