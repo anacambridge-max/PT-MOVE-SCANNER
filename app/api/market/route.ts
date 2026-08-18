@@ -63,14 +63,14 @@ async function searchInstrument(query: string, segment: 'EQ' | 'INDEX', token: s
   ) ?? data[0]
 }
 
-async function getQuotes(keys: string[], token: string[]) {
+async function getQuotes(keys: string[], token: string) {
   if (!keys.length) return {} as Record<string, Quote>
 
   const url = new URL(`${API}/market-quote/quotes`)
   url.searchParams.set('instrument_key', keys.join(','))
 
   const response = await fetch(url, {
-    headers: { Accept: 'application/json', Authorization: `Bearer ${token[0]}` },
+    headers: { Accept: 'application/json', Authorization: `Bearer ${token}` },
     cache: 'no-store',
   })
 
@@ -79,9 +79,9 @@ async function getQuotes(keys: string[], token: string[]) {
   const rawData = (body.data ?? {}) as Record<string, Quote>
   const quotes: Record<string, Quote> = {}
 
-  // Upstox may return the instrument key in colon format (NSE_EQ:...) while
-  // the instrument-search endpoint returns pipe format (NSE_EQ|...).
-  // Store both normalized aliases so quote lookup is reliable.
+  // Upstox can return the instrument key in colon format (NSE_EQ:...) while
+  // instrument search can return pipe format (NSE_EQ|...). Store normalized
+  // aliases so both formats resolve to the same live quote.
   for (const [returnedKey, quote] of Object.entries(rawData)) {
     const normalizedReturnedKey = normalizeInstrumentKey(returnedKey)
     if (normalizedReturnedKey) quotes[normalizedReturnedKey] = quote
@@ -122,7 +122,7 @@ export async function GET() {
       .map((item) => item.instrument?.instrument_key)
       .filter(Boolean) as string[]
 
-    const quotes = await getQuotes([...stockKeys, ...indexKeys], [token])
+    const quotes = await getQuotes([...stockKeys, ...indexKeys], token)
 
     const candidates = stocks.flatMap((item, index) => {
       const key = normalizeInstrumentKey(item.instrument?.instrument_key)
