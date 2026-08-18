@@ -22,10 +22,14 @@ type Candidate = {
   nr7?: boolean
   pdBreak?: string
   t1Date?: string
+  marketDirection?: string
+  marketAligned?: boolean
+  openingRangeBreak?: boolean
+  extremeVolume?: boolean
 }
 
 type IndexQuote = { title: string; value: number | null; change: number | null }
-type MarketResponse = { ok: boolean; source?: string; timestamp?: string; candidates?: Candidate[]; indexes?: IndexQuote[]; error?: string; diagnostics?: { scanned?: number; candidates?: number; marketHours?: boolean } }
+type MarketResponse = { ok: boolean; source?: string; timestamp?: string; candidates?: Candidate[]; indexes?: IndexQuote[]; error?: string; diagnostics?: { scanned?: number; candidates?: number; marketHours?: boolean; marketDirection?: string; niftyChange?: number } }
 
 const fallbackIndexes: IndexQuote[] = [
   { title: 'NIFTY 50', value: null, change: null },
@@ -78,7 +82,9 @@ export default function Home() {
   const aPlus = candidates.filter(c => c.score >= 90).length
   const longCount = candidates.filter(c => c.bias === 'LONG').length
   const shortCount = candidates.filter(c => c.bias === 'SHORT').length
-  const regime = longCount >= shortCount ? 'BULLISH' : 'BEARISH'
+  const extremeCount = candidates.filter(c => c.extremeVolume).length
+  const orbCount = candidates.filter(c => c.openingRangeBreak).length
+  const regime = diagnostics.marketDirection === 'LONG' ? 'BULLISH' : diagnostics.marketDirection === 'SHORT' ? 'BEARISH' : longCount >= shortCount ? 'BULLISH' : 'NEUTRAL'
 
   return (
     <main className="shell">
@@ -96,11 +102,11 @@ export default function Home() {
 
       <section className="hero">
         <div>
-          <div className="eyebrow">LIVE → INTRADAY INTELLIGENCE TERMINAL</div>
+          <div className="eyebrow">LIVE → F&amp;O MOMENTUM TERMINAL</div>
           <h1>Find the stocks <span>before the move.</span></h1>
-          <p>Live Upstox market data scans NSE F&amp;O stocks for high-volume 5-minute breakouts of Previous Day High/Low, with momentum, NR4/NR7 and T-1 confirmation.</p>
+          <p>Live Upstox data scans the NSE F&amp;O universe for high-volume 5-minute PDH/PDL breaks, opening-range confirmation, relative strength, market direction and NR4/NR7 structure.</p>
         </div>
-        <div className="regime-card"><div className="small-label">MARKET REGIME</div><div className="regime">{regime} <b>{regime === 'BULLISH' ? '↑' : '↓'}</b></div><div className="muted">Based on current scanner direction</div></div>
+        <div className="regime-card"><div className="small-label">MARKET REGIME</div><div className="regime">{regime} <b>{regime === 'BULLISH' ? '↑' : regime === 'BEARISH' ? '↓' : '→'}</b></div><div className="muted">NIFTY 50 direction confirmation</div></div>
       </section>
 
       <section className="index-grid">
@@ -115,27 +121,27 @@ export default function Home() {
       </section>
 
       <section className="stats-row">
-        <Stat label="LIVE CANDIDATES" value={String(candidates.length)} note={diagnostics?.scanned ? `${diagnostics.scanned} F&O stocks scanned` : 'Live scanner results'} />
-        <Stat label="LONG SETUPS" value={String(longCount)} note="PDH breakout direction" />
-        <Stat label="SHORT SETUPS" value={String(shortCount)} note="PDL breakdown direction" />
-        <Stat label="A+ SETUPS" value={String(aPlus)} note="Active model score 90 or above" />
+        <Stat label="F&O CANDIDATES" value={String(candidates.length)} note={diagnostics?.scanned ? `${diagnostics.scanned} F&O stocks scanned` : 'Live qualified results'} />
+        <Stat label="EXTREME VOLUME" value={String(extremeCount)} note="5m volume ≥ 2.5× average" />
+        <Stat label="OPENING RANGE" value={String(orbCount)} note="15m high/low confirmation" />
+        <Stat label="A+ SETUPS" value={String(aPlus)} note="Model score 90 or above" />
       </section>
 
       <section className="content-grid">
         <div className="panel candidates-panel">
-          <div className="panel-head"><div><div className="panel-title">LIVE MOVE CANDIDATES</div><div className="panel-sub">5m volume &gt; 2× previous 20-candle average + PDH/PDL breakout</div></div><span className="live-pill"><i /> {loading ? 'CONNECTING' : error ? 'ERROR' : 'LIVE'}</span></div>
-          <div className="table-wrap"><table><thead><tr><th>#</th><th>STOCK</th><th>SCORE</th><th>BIAS</th><th>MOVE</th><th>VOLUME</th><th>REL. STRENGTH</th><th>SETUP</th></tr></thead><tbody>{filtered.map(c => <tr key={c.symbol}><td className="rank">{String(c.rank).padStart(2,'0')}</td><td><div className="stock"><strong>{c.symbol}</strong><span>{c.name}</span></div></td><td><Score value={c.score} /></td><td><span className={`bias ${c.bias.toLowerCase()}`}>{c.bias === 'LONG' ? '↑' : '↓'} {c.bias}</span></td><td className={c.change >= 0 ? 'up' : 'down'}>{c.change > 0 ? '+' : ''}{c.change.toFixed(2)}%</td><td className="volume">{c.volume}</td><td>{c.rs}</td><td><span className="setup">{c.setup}</span></td></tr>)}{!loading && !filtered.length && <tr><td colSpan={8} style={{padding:'28px', textAlign:'center'}}>{error || 'No live candidates match the current filter.'}</td></tr>}</tbody></table></div>
+          <div className="panel-head"><div><div className="panel-title">LIVE F&amp;O MOVE CANDIDATES</div><div className="panel-sub">5m ≥2× volume + PDH/PDL break + momentum / RS confirmation</div></div><span className="live-pill"><i /> {loading ? 'CONNECTING' : error ? 'ERROR' : 'LIVE'}</span></div>
+          <div className="table-wrap"><table><thead><tr><th>#</th><th>STOCK</th><th>SCORE</th><th>BIAS</th><th>MOVE</th><th>RVOL</th><th>REL. STRENGTH</th><th>SETUP</th></tr></thead><tbody>{filtered.map(c => <tr key={c.symbol}><td className="rank">{String(c.rank).padStart(2,'0')}</td><td><div className="stock"><strong>{c.symbol}</strong><span>{c.name}</span></div></td><td><Score value={c.score} /></td><td><span className={`bias ${c.bias.toLowerCase()}`}>{c.bias === 'LONG' ? '↑' : '↓'} {c.bias}</span></td><td className={c.change >= 0 ? 'up' : 'down'}>{c.change > 0 ? '+' : ''}{c.change.toFixed(2)}%</td><td className="volume">{c.rvol?.toFixed(2)}×</td><td>{c.rs}</td><td><span className="setup">{c.setup}</span></td></tr>)}{!loading && !filtered.length && <tr><td colSpan={8} style={{padding:'28px', textAlign:'center'}}>{error || 'No live F&O candidates match the confirmation filters right now.'}</td></tr>}</tbody></table></div>
         </div>
 
-        <aside className="panel sector-panel"><div className="panel-head"><div><div className="panel-title">SECTOR LEADERSHIP</div><div className="panel-sub">Average move across live scanner candidates</div></div></div>{sectorRows(candidates).map(([name, score, move]) => <div className="sector" key={name}><div className="sector-top"><span>{name}</span><b>{move}</b></div><div className="bar"><i style={{width: `${score}%`}} /></div><div className="sector-foot"><span>Live RS proxy</span><span>{score}</span></div></div>)}</aside>
+        <aside className="panel sector-panel"><div className="panel-head"><div><div className="panel-title">SECTOR LEADERSHIP</div><div className="panel-sub">Relative performance of qualified F&amp;O candidates</div></div></div>{sectorRows(candidates).map(([name, score, move]) => <div className="sector" key={name}><div className="sector-top"><span>{name}</span><b>{move}</b></div><div className="bar"><i style={{width: `${score}%`}} /></div><div className="sector-foot"><span>Live RS proxy</span><span>{score}</span></div></div>)}</aside>
       </section>
 
       <section className="bottom-grid">
-        <div className="panel signal-panel"><div className="panel-title">LIVE SCANNER LOGIC</div><div className="logic-grid"><Logic n="01" title="Live Market Data — ACTIVE" text="Upstox live quotes, price, volume and index data" /><Logic n="02" title="5-Minute Breakout — ACTIVE" text="Volume > 2× previous 20-candle average + PDH/PDL break" /><Logic n="03" title="Momentum Confirmation — ACTIVE" text="T-1 trend, 5/20 momentum, NR4/NR7 and relative strength" /><Logic n="04" title="F&O Universe — ACTIVE" text="Scans the current NSE F&O stock universe" /></div></div>
-        <div className="panel disclaimer"><div className="panel-title">MODEL STATUS</div><div className="status-line"><span className="dot" /> {error ? 'Connection error' : 'Upstox LIVE scanner active'}</div><p>{error ? error : 'The LIVE layer identifies stocks matching the configured technical conditions. It is a research and decision-support tool, not a prediction guarantee or investment advice.'}</p><div className="progress"><i style={{width: '85%'}} /></div><div className="muted">Data connector: {error ? 'ERROR' : 'UPSTOX LIVE + HISTORICAL'}</div></div>
+        <div className="panel signal-panel"><div className="panel-title">LIVE SCANNER LOGIC</div><div className="logic-grid"><Logic n="01" title="F&O UNIVERSE — ACTIVE" text="Current NSE stock-futures universe; up to 200 liquid names scanned" /><Logic n="02" title="5M BREAKOUT + VOLUME — ACTIVE" text="PDH/PDL break with ≥2× previous 20-candle volume; ≥2.5× is extreme" /><Logic n="03" title="EARLY-MOVE CONFIRMATION — ACTIVE" text="First 15m range, NIFTY direction, relative strength, EMA 5/20 momentum" /><Logic n="04" title="STRUCTURE — ACTIVE" text="NR4/NR7 compression and T-1 trend improve the final ranking" /></div></div>
+        <div className="panel disclaimer"><div className="panel-title">MODEL STATUS</div><div className="status-line"><span className="dot" /> {error ? 'Connection error' : 'Upstox LIVE F&O scanner active'}</div><p>{error ? error : 'Only stocks passing the configured multi-factor confirmation layer are displayed. This is research and decision-support software, not a prediction guarantee or investment advice.'}</p><div className="progress"><i style={{width: '90%'}} /></div><div className="muted">Data connector: {error ? 'ERROR' : 'UPSTOX LIVE + HISTORICAL'}</div></div>
       </section>
 
-      <footer><span>PT MOVE SCANNER • LIVE ENGINE</span><span>Auto-refresh: 30 seconds • Research &amp; decision support</span></footer>
+      <footer><span>PT MOVE SCANNER • LIVE ENGINE</span><span>Auto-refresh: 30 seconds • NSE F&amp;O • Research &amp; decision support</span></footer>
     </main>
   )
 }
