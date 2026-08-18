@@ -32,6 +32,7 @@ type Candidate = {
 
 type IndexQuote = { title: string; value: number | null; change: number | null }
 type MarketResponse = { ok: boolean; source?: string; timestamp?: string; candidates?: Candidate[]; indexes?: IndexQuote[]; error?: string; filterDate?: string; diagnostics?: { scanned?: number; candidates?: number; marketHours?: boolean; marketDirection?: string; niftyChange?: number } }
+type MoveFilter = 'ALL' | 'UP1' | 'UP2' | 'DOWN1' | 'DOWN2'
 
 const fallbackIndexes: IndexQuote[] = [
   { title: 'NIFTY 50', value: null, change: null },
@@ -45,6 +46,9 @@ export default function Home() {
   const [showLong, setShowLong] = useState(true)
   const [showShort, setShowShort] = useState(true)
   const [activeTab, setActiveTab] = useState<'LIVE' | 'HISTORICAL'>('LIVE')
+  const [moveFilter, setMoveFilter] = useState<MoveFilter>('ALL')
+  const [moveMenu, setMoveMenu] = useState(false)
+  const [moveSort, setMoveSort] = useState<'NONE' | 'DESC' | 'ASC'>('NONE')
   const [candidates, setCandidates] = useState<Candidate[]>([])
   const [historicalCandidates, setHistoricalCandidates] = useState<Candidate[]>([])
   const [indexes, setIndexes] = useState<IndexQuote[]>(fallbackIndexes)
@@ -94,11 +98,21 @@ export default function Home() {
   const activeLoading = activeTab === 'LIVE' ? loading : historicalLoading
   const activeError = activeTab === 'LIVE' ? error : historicalError
   const activeDiagnostics = activeTab === 'LIVE' ? diagnostics : historicalDiagnostics
-  const filtered = useMemo(() => activeCandidates.filter(c => {
-    const match = `${c.symbol} ${c.name} ${c.sector}`.toLowerCase().includes(query.toLowerCase())
-    const bias = (c.bias === 'LONG' && showLong) || (c.bias === 'SHORT' && showShort)
-    return match && bias
-  }), [activeCandidates, query, showLong, showShort])
+  const filtered = useMemo(() => {
+    const rows = activeCandidates.filter(c => {
+      const match = `${c.symbol} ${c.name} ${c.sector}`.toLowerCase().includes(query.toLowerCase())
+      const bias = (c.bias === 'LONG' && showLong) || (c.bias === 'SHORT' && showShort)
+      const move = c.change
+      const moveOk = moveFilter === 'ALL' ||
+        (moveFilter === 'UP1' && move >= 1) ||
+        (moveFilter === 'UP2' && move >= 2) ||
+        (moveFilter === 'DOWN1' && move <= -1) ||
+        (moveFilter === 'DOWN2' && move <= -2)
+      return match && bias && moveOk
+    })
+    if (moveSort === 'NONE') return rows
+    return [...rows].sort((a, b) => moveSort === 'DESC' ? b.change - a.change : a.change - b.change)
+  }, [activeCandidates, query, showLong, showShort, moveFilter, moveSort])
 
   const aPlus = activeCandidates.filter(c => c.score >= 90).length
   const extremeCount = activeCandidates.filter(c => c.extremeVolume).length
@@ -108,6 +122,7 @@ export default function Home() {
   const shortCount = activeCandidates.filter(c => c.bias === 'SHORT').length
   const regime = marketDirection === 'LONG' ? 'BULLISH' : marketDirection === 'SHORT' ? 'BEARISH' : longCount >= shortCount ? 'BULLISH' : 'NEUTRAL'
   const prettyHistoricalDate = historicalDate ? new Date(`${historicalDate}T00:00:00+05:30`).toLocaleDateString('en-IN', { day:'2-digit', month:'short', year:'numeric' }).toUpperCase() : 'PREVIOUS SESSION'
+  const moveLabel = moveFilter === 'ALL' ? 'MOVE' : moveFilter === 'UP1' ? 'MOVE ≥ +1%' : moveFilter === 'UP2' ? 'MOVE ≥ +2%' : moveFilter === 'DOWN1' ? 'MOVE ≤ -1%' : 'MOVE ≤ -2%'
 
   return (
     <main className="shell">
@@ -126,6 +141,7 @@ export default function Home() {
       <section className="control-row">
         <div className="tabs"><button className={activeTab === 'LIVE' ? 'active' : ''} onClick={() => setActiveTab('LIVE')}>LIVE</button><button className={activeTab === 'HISTORICAL' ? 'active' : ''} onClick={() => setActiveTab('HISTORICAL')}>HISTORICAL</button></div>
         <div className="search"><span>⌕</span><input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search stock, sector..." /></div>
+        <div className="move-filter-wrap"><button className={`filter move-filter ${moveFilter !== 'ALL' ? 'on' : ''}`} onClick={() => setMoveMenu(v => !v)}>↕ {moveLabel}</button>{moveMenu && <div className="move-menu"><button onClick={() => {setMoveFilter('ALL');setMoveMenu(false)}}>ALL MOVES</button><button onClick={() => {setMoveFilter('UP1');setMoveMenu(false)}}>GAINERS ≥ +1%</button><button onClick={() => {setMoveFilter('UP2');setMoveMenu(false)}}>GAINERS ≥ +2%</button><button onClick={() => {setMoveFilter('DOWN1');setMoveMenu(false)}}>LOSERS ≤ -1%</button><button onClick={() => {setMoveFilter('DOWN2');setMoveMenu(false)}}>LOSERS ≤ -2%</button></div>}</div>
         <button className={`filter ${showLong ? 'on' : ''}`} onClick={() => setShowLong(v => !v)}>● LONG</button><button className={`filter short ${showShort ? 'on' : ''}`} onClick={() => setShowShort(v => !v)}>● SHORT</button>
       </section>
 
@@ -134,7 +150,7 @@ export default function Home() {
       <section className="content-grid">
         <div className="panel candidates-panel">
           <div className="panel-head"><div><div className="panel-title">{activeTab === 'LIVE' ? 'LIVE F&O MOVE CANDIDATES' : `HISTORICAL FILTERED STOCKS — ${prettyHistoricalDate}`}</div><div className="panel-sub">{activeTab === 'LIVE' ? '5m ≥2× volume + PDH/PDL break + momentum / RS confirmation' : 'Actual previous-session matches • 5m volume + PDH/PDL + ORB + RS + NR4/NR7'}</div></div><span className="live-pill"><i /> {activeLoading ? 'SCANNING' : activeError ? 'ERROR' : activeTab}</span></div>
-          <div className="table-wrap"><table><thead><tr><th>#</th><th>STOCK</th><th>SCORE</th><th>BIAS</th><th>MOVE</th><th>RVOL</th><th>REL. STRENGTH</th><th>SETUP</th></tr></thead><tbody>{filtered.map(c => <tr key={c.symbol}><td className="rank">{String(c.rank).padStart(2,'0')}</td><td><div className="stock"><strong>{c.symbol}</strong><span>{c.name}</span></div></td><td><Score value={c.score} /></td><td><span className={`bias ${c.bias.toLowerCase()}`}>{c.bias === 'LONG' ? '↑' : '↓'} {c.bias}</span></td><td className={c.change >= 0 ? 'up' : 'down'}>{c.change > 0 ? '+' : ''}{c.change.toFixed(2)}%</td><td className="volume">{c.rvol?.toFixed(2)}×</td><td>{c.rs}</td><td><span className="setup">{c.setup}</span></td></tr>)}{!activeLoading && !filtered.length && <tr><td colSpan={8} style={{padding:'28px',textAlign:'center'}}>{activeError || (activeTab === 'LIVE' ? 'No live F&O candidates match the confirmation filters right now.' : `No stocks passed the historical filters for ${prettyHistoricalDate}.`)}</td></tr>}</tbody></table></div>
+          <div className="table-wrap"><table><thead><tr><th>#</th><th>STOCK</th><th>SCORE</th><th>BIAS</th><th><button className={`th-button ${moveSort !== 'NONE' ? 'selected' : ''}`} onClick={() => setMoveSort(v => v === 'NONE' ? 'DESC' : v === 'DESC' ? 'ASC' : 'NONE')}>MOVE {moveSort === 'DESC' ? '↓' : moveSort === 'ASC' ? '↑' : '↕'}</button></th><th>RVOL</th><th>REL. STRENGTH</th><th>SETUP</th></tr></thead><tbody>{filtered.map(c => <tr key={c.symbol}><td className="rank">{String(c.rank).padStart(2,'0')}</td><td><div className="stock"><strong>{c.symbol}</strong><span>{c.name}</span></div></td><td><Score value={c.score} /></td><td><span className={`bias ${c.bias.toLowerCase()}`}>{c.bias === 'LONG' ? '↑' : '↓'} {c.bias}</span></td><td className={c.change >= 0 ? 'up' : 'down'}>{c.change > 0 ? '+' : ''}{c.change.toFixed(2)}%</td><td className="volume">{c.rvol?.toFixed(2)}×</td><td>{c.rs}</td><td><span className="setup">{c.setup}</span></td></tr>)}{!activeLoading && !filtered.length && <tr><td colSpan={8} style={{padding:'28px',textAlign:'center'}}>{activeError || (activeTab === 'LIVE' ? 'No live F&O candidates match the confirmation filters right now.' : `No stocks passed the historical filters for ${prettyHistoricalDate}.`)}</td></tr>}</tbody></table></div>
         </div>
         <aside className="panel sector-panel"><div className="panel-head"><div><div className="panel-title">SECTOR LEADERSHIP</div><div className="panel-sub">Relative performance of qualified {activeTab.toLowerCase()} candidates</div></div></div>{sectorRows(activeCandidates).map(([name,score,move]) => <div className="sector" key={name}><div className="sector-top"><span>{name}</span><b>{move}</b></div><div className="bar"><i style={{width:`${score}%`}} /></div><div className="sector-foot"><span>{activeTab === 'LIVE' ? 'Live RS proxy' : 'Historical RS'}</span><span>{score}</span></div></div>)}</aside>
       </section>
