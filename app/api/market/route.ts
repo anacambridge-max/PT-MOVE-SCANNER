@@ -41,6 +41,14 @@ function normalizeInstrumentKey(key?: string | null) {
   return key?.trim().replace('|', ':') ?? ''
 }
 
+// Upstox net_change is the absolute price change from the previous close.
+// Convert it to a percentage before sending it to the UI.
+function changePercent(lastPrice: number, netChange: number) {
+  const previousClose = lastPrice - netChange
+  if (!Number.isFinite(previousClose) || previousClose === 0) return 0
+  return (netChange / previousClose) * 100
+}
+
 async function searchInstrument(query: string, segment: 'EQ' | 'INDEX', token: string) {
   const url = new URL(`${API}/instruments/search`)
   url.searchParams.set('query', query)
@@ -79,9 +87,6 @@ async function getQuotes(keys: string[], token: string) {
   const rawData = (body.data ?? {}) as Record<string, Quote>
   const quotes: Record<string, Quote> = {}
 
-  // Upstox can return the instrument key in colon format (NSE_EQ:...) while
-  // instrument search can return pipe format (NSE_EQ|...). Store normalized
-  // aliases so both formats resolve to the same live quote.
   for (const [returnedKey, quote] of Object.entries(rawData)) {
     const normalizedReturnedKey = normalizeInstrumentKey(returnedKey)
     if (normalizedReturnedKey) quotes[normalizedReturnedKey] = quote
@@ -131,8 +136,9 @@ export async function GET() {
       const quote = quotes[key]
       if (!quote) return []
 
-      const change = Number(quote.net_change ?? 0)
-      const score = Math.max(50, Math.min(99, Math.round(70 + Math.abs(change) * 10)))
+      const netChange = Number(quote.net_change ?? 0)
+      const change = changePercent(Number(quote.last_price), netChange)
+      const score = Math.max(50, Math.min(99, Math.round(70 + Math.abs(change) * 12)))
       const bias = change >= 0 ? 'LONG' : 'SHORT'
       const volume = quote.volume ? `${quote.volume.toLocaleString('en-IN')}` : '—'
 
@@ -156,10 +162,16 @@ export async function GET() {
     const indexData = indexes.map((item) => {
       const key = normalizeInstrumentKey(item.instrument?.instrument_key)
       const quote = key ? quotes[key] : undefined
+      const lastPrice = quote?.last_price ?? null
+      const netChange = quote?.net_change ?? null
+      const change = lastPrice != null && netChange != null
+        ? changePercent(Number(lastPrice), Number(netChange))
+        : null
+
       return {
         title: item.label,
-        value: quote?.last_price ?? null,
-        change: quote?.net_change ?? null,
+        value: lastPrice,
+        change,
       }
     })
 
