@@ -39,4 +39,4 @@ Import this GitHub repository into a **new Vercel project** and add the environm
 
 The scanner uses Upstox V3 5-minute intraday/historical candles and V3 daily OHLC, while market quotes are batched through the Upstox quote API.
 
-Deployment trigger: latest scanner build synced on 19 Aug 2026.
+Fresh deployment requested: 19 Aug 2026 — live 09:15 session scanner.
