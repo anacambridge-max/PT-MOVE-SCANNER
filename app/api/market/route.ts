@@ -58,9 +58,9 @@ export async function GET(){
     for(const f of fBars){
       const cash=cashByBucket.get(bucket(ts(f)));if(!cash)continue
       const earlier=[...fHist,...fBars.filter(x=>ts(x)<ts(f))].sort((a,b)=>ts(a)-ts(b))
-      const previous19=earlier.slice(Math.max(0,earlier.length-19)).map(c=>+c[5]||0)
+      const previous20=earlier.slice(Math.max(0,earlier.length-20)).map(c=>+c[5]||0)
       const fv=+f[5]||0
-      const sma20=avg([...previous19,fv])
+      const sma20=avg(previous20)
       const volumePass=sma20>0&&fv>sma20*VOLUME_MULTIPLIER
       if(!volumePass)continue
       diagnostics.volumePass++
