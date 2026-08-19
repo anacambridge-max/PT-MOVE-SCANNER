@@ -71,6 +71,12 @@ async function intraday(key:string,t:string){
   const d=await api(`${V3}/historical-candle/intraday/${encodeURIComponent(key)}/minutes/5`,t,'5M intraday')
   return (d.data?.candles??[]) as C[]
 }
+async function historical5m(key:string,toDate:string,fromDate:string,t:string){
+  try{
+    const d=await api(`${V3}/historical-candle/${encodeURIComponent(key)}/minutes/5/${toDate}/${fromDate}`,t,'5M history')
+    return (d.data?.candles??[]) as C[]
+  }catch{return []}
+}
 async function limit<T,R>(a:T[],n:number,fn:(x:T)=>Promise<R>){
   const out:R[]=new Array(a.length);let i=0
   async function worker(){while(true){const j=i++;if(j>=a.length)return;out[j]=await fn(a[j])}}
@@ -81,7 +87,7 @@ export async function GET(){
   const token=process.env.UPSTOX_ANALYTICS_TOKEN
   if(!token)return NextResponse.json({ok:false,error:'UPSTOX_ANALYTICS_TOKEN is not configured'},{status:500})
   try{
-    const all=await master(),today=date()
+    const all=await master(),today=date(),fromDate=date(-7)
     const fut=all.filter(x=>x.segment==='NSE_FO'&&x.instrument_type==='FUT'&&x.underlying_type==='EQUITY'&&x.underlying_key&&x.underlying_symbol&&expiry(x.expiry)>=today)
     const near=[...new Set(fut.map(x=>expiry(x.expiry)).filter(Boolean))].sort()[0]
     const by=new Map<string,I>()
@@ -98,13 +104,18 @@ export async function GET(){
 
     const rows=await limit(universe,CONCURRENCY,async({item,futureKey,cashKey,cashQuote,futureQuote,prev})=>{
       try{
-        const [fbRaw,cbRaw]=await Promise.all([intraday(futureKey,token),intraday(cashKey,token)])
+        const [fbRaw,cbRaw,historyRaw]=await Promise.all([
+          intraday(futureKey,token),
+          intraday(cashKey,token),
+          historical5m(futureKey,date(-1),fromDate,token)
+        ])
         const fb=fbRaw.filter(x=>day(x)===today).sort((a,b)=>time(a)-time(b))
         const cb=cbRaw.filter(x=>day(x)===today).sort((a,b)=>time(a)-time(b))
+        const history=historyRaw.filter(x=>day(x)!==today).sort((a,b)=>time(a)-time(b))
         diagnostics.futuresBars+=fb.length;diagnostics.cashBars+=cb.length
         if(!fb.length||!cb.length)return null
 
-        // Filter 1: current day's high must be above ₹50.
+        // EXACT scanner filter: Daily High > 50.
         const dailyHigh=Math.max(...cb.map(x=>Number(x[2])||0),Number(cashQuote.last_price)||0)
         if(!(dailyHigh>50))return null
         diagnostics.dailyHighPass++
@@ -112,18 +123,22 @@ export async function GET(){
         const fc=fb[fb.length-1],cc=cb[cb.length-1]
         if(Math.abs(time(fc)-time(cc))>5*60*1000)return null
 
-        // Filter 2: current 5M cash candle breaks previous trading day's high/low.
+        // EXACT scanner filter: cash passes ANY ONE of these two conditions.
         const pdh=Number(prev.high),pdl=Number(prev.low)
         const up=Number(cc[2])>pdh
         const dn=Number(cc[3])<pdl
         if(!up&&!dn)return null
         diagnostics.cashBreakoutPass++
 
-        // Filter 3: current 5M futures volume > 2x average of previous 20 completed 5M candles.
-        const completed=fb.slice(0,-1).slice(-20).map(x=>Number(x[5])||0)
-        if(completed.length<20)return null
+        // EXACT Chartink-style SMA(volume,20): SMA includes the current 5-minute candle.
+        // Use earlier 5M history when today's session has fewer than 20 prior bars.
+        const allFutures=[...history,...fb].sort((a,b)=>time(a)-time(b))
+        const currentIndex=allFutures.findIndex(x=>time(x)===time(fc))
+        const windowStart=currentIndex-19
+        if(currentIndex<19||windowStart<0)return null
+        const volumeWindow=allFutures.slice(windowStart,currentIndex+1).map(x=>Number(x[5])||0)
+        const sma=avg(volumeWindow)
         const currentVolume=Number(fc[5])||0
-        const sma=avg(completed)
         const rvol=sma?currentVolume/sma:0
         if(!(sma>0&&currentVolume>sma*VOLUME_MULTIPLIER))return null
         diagnostics.volumePass++
@@ -133,7 +148,7 @@ export async function GET(){
           rank:0,symbol:item.underlying_symbol!.toUpperCase(),name:item.name||item.trading_symbol||item.underlying_symbol!,
           bias:up?'LONG':'SHORT',change:Number(cashQuote.net_change??0),lastPrice:cashQuote.last_price,futurePrice:futureQuote.last_price,
           rvol:+rvol.toFixed(2),volume:currentVolume,avgVolume20:+sma.toFixed(0),breakout:up?'PDH BREAK':'PDL BREAK',signalTime:cc[0],score:100,
-          setup:`5M FUT VOL > 2× SMA20 + ${up?'5M HIGH > PDH':'5M LOW < PDL'} + DAY HIGH > 50`,dailyHigh:+dailyHigh.toFixed(2),
+          setup:`5M FUTURES VOLUME > 2× SMA(VOLUME,20) + ${up?'5M HIGH > 1 DAY AGO HIGH':'5M LOW < 1 DAY AGO LOW'} + DAILY HIGH > 50`,dailyHigh:+dailyHigh.toFixed(2),
           prevDayHigh:pdh,prevDayLow:pdl,conditions:{futuresVolume:true,cashBreakout:true,dailyHighAbove50:true}
         }
       }catch{diagnostics.errors++;return null}
@@ -146,6 +161,6 @@ export async function GET(){
     const labels=['NIFTY 50','BANK NIFTY','NIFTY MIDCAP','INDIA VIX']
     const indexes=indexKeys.map((ik,i)=>{const q=indexQ[clean(ik)];const ch=q?.last_price&&q?.net_change!=null?q.net_change/(q.last_price-q.net_change)*100:null;return{title:labels[i],value:q?.last_price??null,change:ch}})
 
-    return NextResponse.json({ok:true,source:'UPSTOX • EXACT FILTER SCANNER',timestamp:new Date().toISOString(),universeCount:stocks.length,scanned:universe.length,candidates,expiry:near,indexes,diagnostics,filter:{all:true,filters:3,volumeMultiplier:2,volume:'CURRENT 5M FUTURES Volume > 2 × PREVIOUS 20 COMPLETED 5M FUTURES VOLUME SMA',cash:'CURRENT 5M CASH High > Previous Day High OR CURRENT 5M CASH Low < Previous Day Low',dailyHigh:'CURRENT DAY High > 50'}})
+    return NextResponse.json({ok:true,source:'UPSTOX • EXACT 3-FILTER SCANNER',timestamp:new Date().toISOString(),universeCount:stocks.length,scanned:universe.length,candidates,expiry:near,indexes,diagnostics,filter:{all:true,filters:3,volumeMultiplier:2,volume:'5 MINUTE Volume > 5 MINUTE SMA(Volume,20) × 2',cash:'CASH: 5 MINUTE High > 1 DAY AGO High OR 5 MINUTE Low < 1 DAY AGO Low',dailyHigh:'DAILY High > 50'}})
   }catch(e:any){return NextResponse.json({ok:false,error:e?.message||'Market scan failed'},{status:500})}
 }
