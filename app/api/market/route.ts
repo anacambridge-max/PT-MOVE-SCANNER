@@ -7,16 +7,12 @@ const V2 = 'https://api.upstox.com/v2'
 const V3 = 'https://api.upstox.com/v3'
 const MASTER = 'https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz'
 const CONCURRENCY = 12
-const HISTORY_CONCURRENCY = 8
 const TOP = 100
 const VOLUME_MULTIPLIER = 2
-const CPR_WIDTH_PCT = 0.5
 
 type I = { instrument_key:string; trading_symbol?:string; name?:string; segment?:string; instrument_type?:string; underlying_symbol?:string; underlying_key?:string; underlying_type?:string; expiry?:number|string }
 type Q = { instrument_token:string; symbol:string; last_price:number; volume?:number; net_change?:number; oi?:number }
 type C = [string,number,number,number,number,number,number]
-type D = { candles?:C[] }
-type U = {item:I;cashKey:string;futureKey:string;cashQuote:Q;futureQuote:Q;prev:C|null}
 
 const clean = (x?:string|null) => x?.trim().replace('|', ':') ?? ''
 function date(offset=0){
@@ -24,22 +20,13 @@ function date(offset=0){
   const y=+p.find(x=>x.type==='year')!.value,m=+p.find(x=>x.type==='month')!.value,d=+p.find(x=>x.type==='day')!.value
   return new Date(Date.UTC(y,m-1,d+offset)).toISOString().slice(0,10)
 }
-const candleDate=(c:C)=>new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Kolkata',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(c[0]))
+const day=(c:C)=>new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Kolkata',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(c[0]))
 const time=(c:C)=>new Date(c[0]).getTime()
 const avg=(a:number[])=>a.length?a.reduce((x,y)=>x+y,0)/a.length:0
 function expiry(x?:number|string){
   if(typeof x==='string'){const t=Date.parse(x);return Number.isFinite(t)?new Date(t).toISOString().slice(0,10):''}
   if(typeof x==='number'&&Number.isFinite(x))return new Date(x<1e12?x*1000:x).toISOString().slice(0,10)
   return ''
-}
-function cpr(x?:{high:number;low:number;close:number}){
-  if(!x||![x.high,x.low,x.close].every(Number.isFinite))return null
-  const pivot=(x.high+x.low+x.close)/3
-  const bc=(x.high+x.low)/2
-  const tc=2*pivot-bc
-  const width=Math.abs(tc-bc)
-  const pct=pivot?width/pivot*100:Infinity
-  return {pivot,bc,tc,width,pct,pass:pct<CPR_WIDTH_PCT}
 }
 
 async function api(url:string,t:string,label:string){
@@ -68,22 +55,6 @@ async function quotes(keys:string[],t:string){
   }
   return out
 }
-async function historicalPreviousDay(key:string,today:string,t:string):Promise<C|null>{
-  // Ask for a range ending today, then explicitly choose the newest candle
-  // whose IST trading date is before today. This handles weekends/holidays.
-  const from=date(-10)
-  try{
-    const d:D=await api(`${V3}/historical-candle/${encodeURIComponent(key)}/days/1/${today}/${from}`,t,'Previous-day history V3')
-    const candles=(d.data?.candles??[]).filter(x=>Array.isArray(x)&&x.length>=5&&candleDate(x)<today).sort((a,b)=>time(a)-time(b))
-    if(candles.length)return candles[candles.length-1]
-  }catch{}
-  try{
-    const d:D=await api(`${V2}/historical-candle/${encodeURIComponent(key)}/day/${today}/${from}`,t,'Previous-day history V2')
-    const candles=(d.data?.candles??[]).filter(x=>Array.isArray(x)&&x.length>=5&&candleDate(x)<today).sort((a,b)=>time(a)-time(b))
-    if(candles.length)return candles[candles.length-1]
-  }catch{}
-  return null
-}
 async function intraday(key:string,t:string){
   const d=await api(`${V3}/historical-candle/intraday/${encodeURIComponent(key)}/minutes/5`,t,'5M intraday')
   return (d.data?.candles??[]) as C[]
@@ -109,33 +80,19 @@ export async function GET(){
     const cashKeys=stocks.map(x=>x.underlying_key!)
     const futureKeys=stocks.map(x=>x.instrument_key)
     const [cashQ,futureQ]=await Promise.all([quotes(cashKeys,token),quotes(futureKeys,token)])
-    const base=stocks.map(item=>({item,cashKey:clean(item.underlying_key),futureKey:clean(item.instrument_key),cashQuote:cashQ[clean(item.underlying_key)],futureQuote:futureQ[clean(item.instrument_key)]})).filter(x=>x.cashQuote?.last_price>0&&x.futureQuote?.last_price>0)
+    const universe=stocks.map(item=>({item,cashKey:clean(item.underlying_key),futureKey:clean(item.instrument_key),cashQuote:cashQ[clean(item.underlying_key)],futureQuote:futureQ[clean(item.instrument_key)]})).filter(x=>x.cashQuote?.last_price>0&&x.futureQuote?.last_price>0)
 
-    const historyResults=await limit(base,HISTORY_CONCURRENCY,async u=>({u,prev:await historicalPreviousDay(u.cashKey,today,token)}))
-    const diagnostics={universe:stocks.length,quoteMatched:base.length,historyMatched:0,cprChecked:0,cprPass:0,dailyHighPass:0,cashBars:0,futuresBars:0,cashBreakoutPass:0,volumePass:0,finalPass:0,errors:0}
+    const diagnostics={universe:stocks.length,quoteMatched:universe.length,cashBars:0,futuresBars:0,dailyHighPass:0,cashBreakoutPass:0,volumePass:0,finalPass:0,errors:0}
 
-    const prepared:U[]=[]
-    for(const r of historyResults){
-      if(!r.prev)continue
-      diagnostics.historyMatched++
-      const p=r.prev
-      diagnostics.cprChecked++
-      const z=cpr({high:+p[2],low:+p[3],close:+p[4]})
-      if(!z?.pass)continue
-      diagnostics.cprPass++
-      prepared.push({...r.u,prev:p})
-    }
-
-    const rows=await limit(prepared,CONCURRENCY,async({item,futureKey,cashKey,cashQuote,futureQuote,prev})=>{
+    const rows=await limit(universe,CONCURRENCY,async({item,futureKey,cashKey,cashQuote,futureQuote})=>{
       try{
         const [fbRaw,cbRaw]=await Promise.all([intraday(futureKey,token),intraday(cashKey,token)])
-        const fb=fbRaw.sort((a,b)=>time(a)-time(b)),cb=cbRaw.sort((a,b)=>time(a)-time(b))
+        const fb=fbRaw.filter(x=>day(x)===today).sort((a,b)=>time(a)-time(b))
+        const cb=cbRaw.filter(x=>day(x)===today).sort((a,b)=>time(a)-time(b))
         diagnostics.futuresBars+=fb.length;diagnostics.cashBars+=cb.length
         if(!fb.length||!cb.length)return null
 
-        const z=cpr({high:+prev[2],low:+prev[3],close:+prev[4]})
-        if(!z?.pass)return null
-
+        // Filter 1: current day's high must be above ₹50.
         const dailyHigh=Math.max(...cb.map(x=>Number(x[2])||0),Number(cashQuote.last_price)||0)
         if(!(dailyHigh>50))return null
         diagnostics.dailyHighPass++
@@ -143,13 +100,23 @@ export async function GET(){
         const fc=fb[fb.length-1],cc=cb[cb.length-1]
         if(Math.abs(time(fc)-time(cc))>5*60*1000)return null
 
-        const pdh=Number(prev[2])
-        const pdl=Number(prev[3])
+        // Filter 2: current 5M cash candle breaks previous trading day's high/low.
+        // The daily OHLC quote's prev_ohlc is intentionally not used here; derive
+        // the previous-day levels from the last daily candle returned by V2 OHLC.
+        const pd=new URL(`${V2}/market-quote/ohlc`)
+        pd.searchParams.set('instrument_key',cashKey)
+        pd.searchParams.set('interval','1d')
+        const daily=(await api(pd.toString(),token,'Daily OHLC')).data??{}
+        const raw=Object.values(daily)[0] as any
+        const prev=raw?.prev_ohlc
+        if(!prev)return null
+        const pdh=Number(prev.high),pdl=Number(prev.low)
         const up=Number(cc[2])>pdh
         const dn=Number(cc[3])<pdl
         if(!up&&!dn)return null
         diagnostics.cashBreakoutPass++
 
+        // Filter 3: current 5M futures volume > 2x average of previous 20 completed 5M candles.
         const completed=fb.slice(0,-1).slice(-20).map(x=>Number(x[5])||0)
         if(completed.length<20)return null
         const currentVolume=Number(fc[5])||0
@@ -163,8 +130,8 @@ export async function GET(){
           rank:0,symbol:item.underlying_symbol!.toUpperCase(),name:item.name||item.trading_symbol||item.underlying_symbol!,
           bias:up?'LONG':'SHORT',change:Number(cashQuote.net_change??0),lastPrice:cashQuote.last_price,futurePrice:futureQuote.last_price,
           rvol:+rvol.toFixed(2),volume:currentVolume,avgVolume20:+sma.toFixed(0),breakout:up?'PDH BREAK':'PDL BREAK',signalTime:cc[0],score:100,
-          setup:`5M FUT VOL > 2× SMA20 + ${up?'5M HIGH > PDH':'5M LOW < PDL'} + CURRENT-DAY HIGH > 50 + PREVIOUS-DAY NARROW CPR`,cprWidth:+z.pct.toFixed(3),dailyHigh:+dailyHigh.toFixed(2),
-          prevDayHigh:pdh,prevDayLow:pdl,conditions:{futuresVolume:true,cashBreakout:true,dailyHighAbove50:true,narrowCPR:true}
+          setup:`5M FUT VOL > 2× SMA20 + ${up?'5M HIGH > PDH':'5M LOW < PDL'} + DAY HIGH > 50`,dailyHigh:+dailyHigh.toFixed(2),
+          prevDayHigh:pdh,prevDayLow:pdl,conditions:{futuresVolume:true,cashBreakout:true,dailyHighAbove50:true}
         }
       }catch{diagnostics.errors++;return null}
     })
@@ -176,6 +143,6 @@ export async function GET(){
     const labels=['NIFTY 50','BANK NIFTY','NIFTY MIDCAP','INDIA VIX']
     const indexes=indexKeys.map((ik,i)=>{const q=indexQ[clean(ik)];const ch=q?.last_price&&q?.net_change!=null?q.net_change/(q.last_price-q.net_change)*100:null;return{title:labels[i],value:q?.last_price??null,change:ch}})
 
-    return NextResponse.json({ok:true,source:'UPSTOX • EXACT FILTER SCANNER',timestamp:new Date().toISOString(),universeCount:stocks.length,scanned:base.length,candidates,expiry:near,indexes,diagnostics,filter:{all:true,volumeMultiplier:2,cprWidthPct:.5,volume:'CURRENT 5M FUTURES Volume > 2 × PREVIOUS 20 COMPLETED 5M FUTURES VOLUME SMA',cash:'CURRENT 5M CASH High > Previous Day High OR CURRENT 5M CASH Low < Previous Day Low',dailyHigh:'CURRENT DAY High > 50',cpr:'PREVIOUS COMPLETED TRADING-DAY CPR width / Pivot < 0.5%'}})
+    return NextResponse.json({ok:true,source:'UPSTOX • EXACT FILTER SCANNER',timestamp:new Date().toISOString(),universeCount:stocks.length,scanned:universe.length,candidates,expiry:near,indexes,diagnostics,filter:{all:true,filters:3,volumeMultiplier:2,volume:'CURRENT 5M FUTURES Volume > 2 × PREVIOUS 20 COMPLETED 5M FUTURES VOLUME SMA',cash:'CURRENT 5M CASH High > Previous Day High OR CURRENT 5M CASH Low < Previous Day Low',dailyHigh:'CURRENT DAY High > 50'}})
   }catch(e:any){return NextResponse.json({ok:false,error:e?.message||'Market scan failed'},{status:500})}
 }
