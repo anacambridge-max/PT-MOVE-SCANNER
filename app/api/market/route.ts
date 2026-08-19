@@ -23,8 +23,16 @@ async function quotes(keys:string[],t:string){const out:Record<string,Q>={};for(
 async function dailyOhlc(keys:string[],t:string){const out:Record<string,O>={};for(let i=0;i<keys.length;i+=500){const u=new URL(`${V3}/market-quote/ohlc`);u.searchParams.set('instrument_key',keys.slice(i,i+500).join(','));u.searchParams.set('interval','1d');const d=(await upstoxJson(u.toString(),t,'Daily OHLC')).data??{};for(const [k,q] of Object.entries(d) as [string,O][])out[key(k)]=q,out[key(q.instrument_token)]=q}return out}
 async function intraday5m(k:string,t:string){const d=await upstoxJson(`${V3}/historical-candle/intraday/${encodeURIComponent(k)}/minutes/5`,t,'Intraday 5m');return(d.data?.candles??[]) as C[]}
 async function intraday1m(k:string,t:string){const d=await upstoxJson(`${V3}/historical-candle/intraday/${encodeURIComponent(k)}/minutes/1`,t,'Intraday 1m');return(d.data?.candles??[]) as C[]}
-async function historical5m(k:string,t:string){const d=await upstoxJson(`${V3}/historical-candle/${encodeURIComponent(k)}/minutes/5/${date(-1)}/${date(-7)}`,t,'Previous 5m volume');return(d.data?.candles??[]) as C[]}
+async function historical5m(k:string,t:string){const d=await upstoxJson(`${V3}/historical-candle/${encodeURIComponent(k)}/minutes/5/${date(-1)}/${date(-7)}`,t,'Previous 5m history');return(d.data?.candles??[]) as C[]}
 function completed(c:C[]){const now=Date.now();return c.filter(x=>new Date(x[0]).getTime()+5*60*1000<=now).sort((a,b)=>new Date(a[0]).getTime()-new Date(b[0]).getTime())}
+function previousDayLevels(prevOhlc:O['prev_ohlc']|undefined,history:C[]){
+ if(prevOhlc&&Number.isFinite(prevOhlc.high)&&Number.isFinite(prevOhlc.low))return{high:prevOhlc.high,low:prevOhlc.low,source:'UPSTOX_PREV_OHLC'}
+ const days=completed(history).filter(c=>dayOf(c)<date());
+ if(!days.length)return null
+ const latestDay=[...new Set(days.map(dayOf))].sort().at(-1);if(!latestDay)return null
+ const rows=days.filter(c=>dayOf(c)===latestDay);if(!rows.length)return null
+ return{high:Math.max(...rows.map(c=>+c[2])),low:Math.min(...rows.map(c=>+c[3])),source:'HISTORICAL_5M'}
+}
 function trigger(sessionRaw:C[],prev5m:C[],prevHigh:number,prevLow:number,livePrice:number){
  const session=[...sessionRaw].sort((a,b)=>new Date(a[0]).getTime()-new Date(b[0]).getTime());if(!session.length)return null
  const history=completed(prev5m).filter(c=>dayOf(c)<date())
@@ -35,7 +43,8 @@ function trigger(sessionRaw:C[],prev5m:C[],prevHigh:number,prevLow:number,livePr
   const prior=[...history,...done.filter(x=>new Date(x[0]).getTime()<start)].slice(-20).map(x=>+x[5]||0)
   const sma=avg(prior)
   if(prior.length<20||!sma||v/sma<EXTREME_MULTIPLE)continue
-  const cl=forming&&livePrice>0?livePrice:+c[4],h=Math.max(+c[2],forming?livePrice:+c[2]),lo=Math.min(+c[3],forming?livePrice:+c[3])
+  const cl=forming&&livePrice>0?livePrice:+c[4]
+  const h=Math.max(+c[2],forming&&livePrice>0?livePrice:+c[2]),lo=Math.min(+c[3],forming&&livePrice>0?livePrice:+c[3])
   const longBreak=cl>prevHigh&&h>prevHigh,shortBreak=cl<prevLow&&lo<prevLow
   if(!longBreak&&!shortBreak)continue
   best={vr:v/sma,direction:longBreak?'LONG':'SHORT',pdBreak:longBreak?'PDH':'PDL',candleTime:c[0],close:cl,high:h,low:lo,forming}
@@ -71,23 +80,23 @@ export async function GET(){
   const [qs,ohlcs]=await Promise.all([quotes(stockKeys.concat(ix.map(x=>x.instrument?.instrument_key).filter(Boolean) as string[]),token),dailyOhlc(stockKeys,token)])
   const nifty=ix.find(x=>x.label==='NIFTY 50')?.instrument?.instrument_key,nq=nifty?qs[key(nifty)]:undefined,niftyChange=Number(nq?.net_change??0)
   const marketHours=istHour()>=9&&istHour()<16,marketDirection=niftyChange>0.15?'LONG':niftyChange<-0.15?'SHORT':'NEUTRAL'
-  const universe=stocks.map(item=>({item,key:key(item.underlying_key),quote:qs[key(item.underlying_key)],ohlc:ohlcs[key(item.underlying_key)]})).filter((x):x is {item:I;key:string;quote:Q;ohlc:O}=>Boolean(x.quote&&x.quote.last_price>0&&x.ohlc?.prev_ohlc))
+  const universe=stocks.map(item=>({item,key:key(item.underlying_key),quote:qs[key(item.underlying_key)],ohlc:ohlcs[key(item.underlying_key)]})).filter((x):x is {item:I;key:string;quote:Q;ohlc:O}=>Boolean(x.quote&&x.quote.last_price>0))
   const scanPool=universe
-  let intradaySuccess=0,intradayErrors=0,triggerCount=0,liveFallbackChecks=0,liveFallbackHits=0
+  let intradaySuccess=0,intradayErrors=0,triggerCount=0,liveFallbackChecks=0,liveFallbackHits=0,pdhSourceCounts={UPSTOX_PREV_OHLC:0,HISTORICAL_5M:0,FAILED:0}
   const rows=await map(scanPool,CONCURRENCY,async({item,key,quote,ohlc})=>{
    try{
     const session=await intraday5m(key,token)
     const early=completed(session).length<20
     const prior=early?await historical5m(key,token):[]
-    const p=ohlc.prev_ohlc!
-    let f=trigger(session,prior,p.high,p.low,quote.last_price)
-    // Upstox's intraday candle endpoint is historical/current-day data. If the live 5M candle is not yet exposed there,
-    // rebuild the currently-forming 5M candle from 1M candles — but only for stocks that actually crossed PDH/PDL today.
-    const dailyBreak=Boolean(ohlc.live_ohlc&&(ohlc.live_ohlc.high>p.high||ohlc.live_ohlc.low<p.low||quote.last_price>p.high||quote.last_price<p.low))
+    const levels=previousDayLevels(ohlc?.prev_ohlc,prior)
+    if(!levels){pdhSourceCounts.FAILED++;intradaySuccess++;return null}
+    pdhSourceCounts[levels.source]++
+    let f=trigger(session,prior,levels.high,levels.low,quote.last_price)
+    const dailyBreak=Boolean(quote.last_price>levels.high||quote.last_price<levels.low)
     if(!f&&dailyBreak){
       liveFallbackChecks++
       const one=await intraday1m(key,token)
-      const fb=current5mFrom1m(one,p.high,p.low,quote.last_price,session,prior)
+      const fb=current5mFrom1m(one,levels.high,levels.low,quote.last_price,session,prior)
       if(fb){f=fb;liveFallbackHits++}
     }
     intradaySuccess++
@@ -95,11 +104,11 @@ export async function GET(){
     triggerCount++
     const change=Number(quote.net_change??0),rsAligned=f.direction==='LONG'?change>niftyChange+0.25:change<niftyChange-0.25,marketAligned=marketDirection==='NEUTRAL'||f.direction===marketDirection
     const score=Math.min(99,Math.round(60+Math.min(25,(f.vr-EXTREME_MULTIPLE)*7)+(rsAligned?7:0)+(marketAligned?4:0)))
-    return{rank:0,symbol:item.underlying_symbol!.toUpperCase(),name:item.name||item.trading_symbol||item.underlying_symbol!,sector:'F&O',score,bias:f.direction,change,volume:(quote.volume??0).toLocaleString('en-IN'),rs:rsAligned?'Strong':'Neutral',setup:`EXT VOL ${f.vr.toFixed(2)}× + ${f.pdBreak} BREAK${f.forming?' • LIVE 5M':''}`,confidence:score>=90?'A+':score>=80?'A':score>=70?'B+':'B',lastPrice:quote.last_price,oi:quote.oi??null,rvol:+f.vr.toFixed(2),rangePct:0,nr4:false,nr7:false,pdBreak:f.pdBreak,t1Date:date(),filterPass:true,filterLabel:'LIVE NSE F&O + 5M candle close/current price beyond PDH/PDL + extreme volume ≥2.5× previous 20 completed 5M candles',filterDate:date(),signalTime:f.candleTime,marketDirection,marketAligned,openingRangeBreak:false,extremeVolume:true,forming:f.forming}
+    return{rank:0,symbol:item.underlying_symbol!.toUpperCase(),name:item.name||item.trading_symbol||item.underlying_symbol!,sector:'F&O',score,bias:f.direction,change,volume:(quote.volume??0).toLocaleString('en-IN'),rs:rsAligned?'Strong':'Neutral',setup:`EXT VOL ${f.vr.toFixed(2)}× + ${f.pdBreak} BREAK${f.forming?' • LIVE 5M':''}`,confidence:score>=90?'A+':score>=80?'A':score>=70?'B+':'B',lastPrice:quote.last_price,oi:quote.oi??null,rvol:+f.vr.toFixed(2),rangePct:0,nr4:false,nr7:false,pdBreak:f.pdBreak,t1Date:date(),filterPass:true,filterLabel:'LIVE NSE F&O + 5M candle close/current price beyond previous-session PDH/PDL + extreme volume ≥2.5× previous 20 completed 5M candles',filterDate:date(),signalTime:f.candleTime,marketDirection,marketAligned,openingRangeBreak:false,extremeVolume:true,forming:f.forming}
    }catch{intradayErrors++;return null}
   })
   const candidates=rows.filter((x):x is NonNullable<typeof x>=>Boolean(x)).sort((a,b)=>new Date(b.signalTime).getTime()-new Date(a.signalTime).getTime()||b.score-a.score).slice(0,TOP).map((x,i)=>({...x,rank:i+1}))
   const indexesOut=ix.map(x=>{const q=qs[key(x.instrument?.instrument_key)],last=q?.last_price??null,net=q?.net_change??null;return{title:x.label,value:last,change:last&&net!=null?net/(last-net)*100:null}})
-  return NextResponse.json({ok:true,source:'UPSTOX LIVE + V3 5M PDH/PDL EXTREME-VOLUME ENGINE',timestamp:new Date().toISOString(),universeCount,scanned:universe.length,expiry:nearExpiry,diagnostics:{intradaySuccess,intradayErrors,triggerCount,scanPool:scanPool.length,candidates:candidates.length,liveFallbackChecks,liveFallbackHits,marketHours,marketDirection,niftyChange},filter:{universe:'NSE F&O stock futures — all current near-expiry underlyings checked directly from 5M candles',fiveMinuteVolume:'5m candle volume ≥ 2.5 × previous 20 completed 5m candles — mandatory',breakout:'5m candle close/current live price > previous-day HIGH (PDH) for LONG OR < previous-day LOW (PDL) for SHORT — mandatory',candidateRule:'A stock appears only when BOTH PDH/PDL breakout and extreme volume occur on the same 5m candle; currently forming candle is also reconstructed from 1M data when necessary',marketDirection:'NIFTY 50 direction is confirmation only; it does not block a valid PDH/PDL + extreme-volume signal',price:'No artificial price filter'},candidates,indexes:indexesOut})
+  return NextResponse.json({ok:true,source:'UPSTOX LIVE + V3 5M PDH/PDL EXTREME-VOLUME ENGINE',timestamp:new Date().toISOString(),universeCount,scanned:universe.length,expiry:nearExpiry,diagnostics:{intradaySuccess,intradayErrors,triggerCount,scanPool:scanPool.length,candidates:candidates.length,liveFallbackChecks,liveFallbackHits,pdhSourceCounts,marketHours,marketDirection,niftyChange},filter:{universe:'NSE F&O stock futures — all current near-expiry underlyings checked directly from 5M candles',fiveMinuteVolume:'5m candle volume ≥ 2.5 × previous 20 completed 5m candles — mandatory',breakout:'5m candle close/current price > previous-session HIGH (PDH) for LONG OR < previous-session LOW (PDL) for SHORT — mandatory',candidateRule:'A stock appears only when BOTH the PDH/PDL breakout and extreme-volume condition occur on the same 5m candle; the currently forming 5m candle is reconstructed from 1M data when necessary',marketDirection:'NIFTY 50 direction is confirmation only; it never blocks a valid PDH/PDL + extreme-volume signal',price:'No artificial price filter'},candidates,indexes:indexesOut})
  }catch(e){return NextResponse.json({ok:false,error:e instanceof Error?e.message:'Market scan failed'},{status:500})}
 }
