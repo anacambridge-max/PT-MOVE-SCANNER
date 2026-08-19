@@ -41,7 +41,7 @@ export async function GET(){
   const universe=stocks.map(item=>({item,cashKey:k(item.underlying_key),futureKey:k(item.instrument_key),cashQuote:cashQ[k(item.underlying_key)],futureQuote:futureQ[k(item.instrument_key)],ohlc:daily[k(item.underlying_key)]})).filter(x=>x.cashQuote?.last_price>0&&x.futureQuote?.last_price>0)
   const diagnostics={universe:stocks.length,quoteMatched:universe.length,cprPass:0,dailyHighPass:0,cashBars:0,currentCashBreakout:0,futuresChecked:0,futuresBars:0,volumePass:0,breakoutPass:0,finalPass:0,errors:0}
 
-  // FAST STAGE 1: use batched daily OHLC only. Do NOT request 5M candles for the full F&O universe.
+  // STAGE 1: cheap daily filters first.
   const pre=universe.filter(u=>{
    const prevH=u.ohlc?.prev_ohlc?.high??NaN,prevL=u.ohlc?.prev_ohlc?.low??NaN,prevC=u.ohlc?.prev_ohlc?.close??NaN
    const z=cpr({high:prevH,low:prevL,close:prevC});if(!z?.pass)return false;diagnostics.cprPass++
@@ -49,32 +49,59 @@ export async function GET(){
    return true
   })
 
-  // STAGE 2: only shortlisted stocks get 5M cash candles for the PDH/PDL breakout test.
+  // STAGE 2: fetch today's 5M cash candles for shortlisted stocks.
   const cashRows=await limit(pre,CONCURRENCY,async u=>{try{return{...u,cashBars:bars(await intraday(u.cashKey,token),today)}}catch{diagnostics.errors++;return{...u,cashBars:[] as C[]}}})
-  const cashBreakouts=cashRows.filter(u=>{
-   if(!u.cashBars.length)return false;diagnostics.cashBars++
-   const cur=u.cashBars[u.cashBars.length-1],ph=u.ohlc?.prev_ohlc?.high??NaN,pl=u.ohlc?.prev_ohlc?.low??NaN
-   const up=+cur[2]>ph,dn=+cur[3]<pl;if(!up&&!dn)return false;diagnostics.currentCashBreakout++;return true
-  })
 
-  // STAGE 3: only actual cash breakouts get the futures 5M volume request.
-  const rows=await limit(cashBreakouts,CONCURRENCY,async({item,futureKey,cashQuote,futureQuote,ohlc,cashBars})=>{try{
+  // STAGE 3: find the signal candle anywhere in today's session, not only the latest candle.
+  // The CASH breakout and FUTURES volume spike must occur on the same 5M timestamp.
+  const rows=await limit(cashRows.filter(u=>u.cashBars.length),CONCURRENCY,async({item,futureKey,cashQuote,futureQuote,ohlc,cashBars})=>{try{
+   diagnostics.cashBars++
    diagnostics.futuresChecked++
    const fb=bars(await intraday(futureKey,token),today);if(!fb.length)return null;diagnostics.futuresBars++
-   const cur=fb[fb.length-1],prev=fb.filter(x=>ts(x)<ts(cur));let h=[...prev]
-   if(h.length<19){const old=await history(futureKey,token,yesterday,date(-30));h=[...old.filter(x=>day(x)<today),...h].sort((a,b)=>ts(a)-ts(b))}
-   const p19=h.slice(-19).map(x=>+x[5]||0);if(p19.length<19)return null
-   // SMA20 is the average of the PREVIOUS 20 completed 5M candles; current candle is compared against it.
-   const p20=h.slice(-20).map(x=>+x[5]||0);if(p20.length<20)return null
-   const v=+cur[5]||0,sma=avg(p20);if(!(sma>0&&v>sma*VOLUME_MULTIPLIER))return null;diagnostics.volumePass++
-   const cc=cashBars[cashBars.length-1],ph=ohlc?.prev_ohlc?.high??NaN,pl=ohlc?.prev_ohlc?.low??NaN,pc=ohlc?.prev_ohlc?.close??NaN,up=+cc[2]>ph,dn=+cc[3]<pl;if(!up&&!dn)return null;diagnostics.breakoutPass++
-   const z=cpr({high:ph,low:pl,close:pc})!,dh=ohlc?.live_ohlc?.high??0;diagnostics.finalPass++
-   return{rank:0,symbol:item.underlying_symbol!.toUpperCase(),name:item.name||item.trading_symbol||item.underlying_symbol!,bias:up?'LONG':'SHORT',change:Number(cashQuote.net_change??0),lastPrice:cashQuote.last_price,futurePrice:futureQuote.last_price,rvol:+(v/sma).toFixed(2),volume:v,avgVolume20:+sma.toFixed(0),breakout:up?'PDH BREAK':'PDL BREAK',signalTime:cur[0],score:100,setup:`5M FUT VOL > 2× SMA20 + ${up?'PDH':'PDL'} BREAK + NARROW CPR`,cpr:z,cprWidth:+z.pct.toFixed(3),dailyHigh:+dh.toFixed(2),prevDayHigh:ph,prevDayLow:pl,conditions:{futuresVolume:true,cashBreakout:true,dailyHighAbove50:true,narrowCPR:true}}
+
+   // Build a completed-candle history before each current 5M candle. If today's
+   // first candles do not have 20 prior bars, pull up to 30 days of 5M history.
+   let old:C[]=[]
+   if(fb.length<21){
+    old=await history(futureKey,token,yesterday,date(-30)).then(a=>a.filter(x=>day(x)<today).sort((a,b)=>ts(a)-ts(b))).catch(()=>[])
+   }
+   const pool=[...old,...fb].sort((a,b)=>ts(a)-ts(b))
+   const todayFuture=fb
+   const cashByTs=new Map<number,C>()
+   for(const c of cashBars)cashByTs.set(ts(c),c)
+
+   let latest:null|{cash:C;future:C;sma:number;rvol:number;up:boolean;dn:boolean}=null
+   for(const cur of todayFuture){
+    const curTs=ts(cur),cc=cashByTs.get(curTs)
+    if(!cc)continue
+    const ph=ohlc?.prev_ohlc?.high??NaN,pl=ohlc?.prev_ohlc?.low??NaN
+    const up=+cc[2]>ph,dn=+cc[3]<pl
+    if(!up&&!dn)continue
+    diagnostics.currentCashBreakout++
+    const prior=pool.filter(x=>ts(x)<curTs)
+    if(prior.length<20)continue
+    const p20=prior.slice(-20).map(x=>+x[5]||0)
+    if(p20.length<20)continue
+    const sma=avg(p20),v=+cur[5]||0
+    if(!(sma>0&&v>sma*VOLUME_MULTIPLIER))continue
+    diagnostics.volumePass++
+    latest={cash:cc,future:cur,sma,rvol:v/sma,up,dn}
+   }
+
+   if(!latest)return null
+   diagnostics.breakoutPass++
+   const {cash:cc,future:cur,sma,rvol,up}=latest
+   const ph=ohlc?.prev_ohlc?.high??NaN,pl=ohlc?.prev_ohlc?.low??NaN,pc=ohlc?.prev_ohlc?.close??NaN
+   const z=cpr({high:ph,low:pl,close:pc})!;const dh=ohlc?.live_ohlc?.high??0
+   diagnostics.finalPass++
+   return{rank:0,symbol:item.underlying_symbol!.toUpperCase(),name:item.name||item.trading_symbol||item.underlying_symbol!,bias:up?'LONG':'SHORT',change:Number(cashQuote.net_change??0),lastPrice:cashQuote.last_price,futurePrice:futureQuote.last_price,rvol:+rvol.toFixed(2),volume:+(+cur[5]||0),avgVolume20:+sma.toFixed(0),breakout:up?'PDH BREAK':'PDL BREAK',signalTime:cur[0],score:100,setup:`5M FUT VOL > 2× SMA20 + ${up?'PDH':'PDL'} BREAK + NARROW CPR`,cpr:z,cprWidth:+z.pct.toFixed(3),dailyHigh:+dh.toFixed(2),prevDayHigh:ph,prevDayLow:pl,conditions:{futuresVolume:true,cashBreakout:true,dailyHighAbove50:true,narrowCPR:true}}
   }catch{diagnostics.errors++;return null}})
+
+  // One row per stock: the most recent qualifying signal from today.
   const candidates=rows.filter(Boolean).sort((a:any,b:any)=>new Date(b.signalTime).getTime()-new Date(a.signalTime).getTime()).slice(0,TOP).map((x:any,i)=>({...x,rank:i+1}))
 
   const indexKeys=['NSE_INDEX|Nifty 50','NSE_INDEX|Nifty Bank','NSE_INDEX|Nifty Midcap 100','NSE_INDEX|India VIX'];const indexQ=await quotes(indexKeys,token)
   const labels=['NIFTY 50','BANK NIFTY','NIFTY MIDCAP','INDIA VIX'];const indexes=indexKeys.map((ik,i)=>{const q=indexQ[k(ik)];const ch=q?.last_price&&q?.net_change!=null?q.net_change/(q.last_price-q.net_change)*100:null;return{title:labels[i],value:q?.last_price??null,change:ch}})
-  return NextResponse.json({ok:true,source:'UPSTOX • EXACT FILTER SCANNER',timestamp:new Date().toISOString(),universeCount:stocks.length,scanned:universe.length,candidates,expiry:near,indexes,diagnostics,filter:{all:true,volumeMultiplier:2,cprWidthPct:.5,volume:'5M FUTURES Volume > 2 × 5M SMA(Volume,20)',cash:'5M CASH High > previous day High OR 5M CASH Low < previous day Low',dailyHigh:'Current Daily High > 50',cpr:'Previous-day CPR width / Pivot < 0.5%'}})
+  return NextResponse.json({ok:true,source:'UPSTOX • EXACT FILTER SCANNER',timestamp:new Date().toISOString(),universeCount:stocks.length,scanned:universe.length,candidates,expiry:near,indexes,diagnostics,filter:{all:true,volumeMultiplier:2,cprWidthPct:.5,volume:'5M FUTURES Volume > 2 × 5M SMA(Volume,20) ON SIGNAL CANDLE',cash:'5M CASH High > previous day High OR 5M CASH Low < previous day Low ON SAME CANDLE',dailyHigh:'Current Daily High > 50',cpr:'Previous-day CPR width / Pivot < 0.5%'}})
  }catch(e:any){return NextResponse.json({ok:false,error:e?.message||'Market scan failed'},{status:500})}
 }
