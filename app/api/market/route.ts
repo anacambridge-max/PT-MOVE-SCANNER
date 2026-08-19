@@ -31,7 +31,7 @@ type Quote = {
 }
 
 type Candle = [string, number, number, number, number, number, number]
-type Daily = { prev_ohlc?: { open: number; high: number; low: number; close: number } }
+type PreviousDay = { high: number; low: number; open: number; close: number; date: string }
 
 const clean = (x?: string | null) => x?.trim().replace('|', ':') ?? ''
 
@@ -99,18 +99,6 @@ async function getQuotes(keys: string[], token: string) {
   return output
 }
 
-async function getDailyOhlc(keys: string[], token: string) {
-  const output: Record<string, Daily> = {}
-  for (let i = 0; i < keys.length; i += 400) {
-    const url = new URL(`${V3}/market-quote/ohlc`)
-    url.searchParams.set('instrument_key', keys.slice(i, i + 400).join(','))
-    url.searchParams.set('interval', '1d')
-    const data = (await upstox(url.toString(), token, 'Daily OHLC')).data ?? {}
-    for (const [key, value] of Object.entries(data) as [string, Daily][]) output[clean(key)] = value
-  }
-  return output
-}
-
 async function getIntraday5m(key: string, token: string) {
   const data = await upstox(`${V3}/historical-candle/intraday/${encodeURIComponent(key)}/minutes/5`, token, '5M intraday')
   return (data.data?.candles ?? []) as Candle[]
@@ -123,6 +111,25 @@ async function getHistorical5m(key: string, toDate: string, fromDate: string, to
     '5M history',
   )
   return (data.data?.candles ?? []) as Candle[]
+}
+
+// IMPORTANT: V3 /market-quote/ohlc with interval=1d returns the live daily OHLC,
+// not the previous day's high/low. Chartink's "1 day ago High/Low" requires the
+// previous completed daily candle, so fetch historical daily candles instead.
+async function getPreviousDay(key: string, token: string): Promise<PreviousDay | null> {
+  const today = istDate()
+  const data = await upstox(
+    `${V3}/historical-candle/${encodeURIComponent(key)}/days/1/${today}/${istDate(-10)}`,
+    token,
+    'Daily history',
+  )
+  const candles = (data.data?.candles ?? []) as Candle[]
+  const completed = candles
+    .filter(c => candleDay(c) < today)
+    .sort((a, b) => candleTime(b) - candleTime(a))
+  const c = completed[0]
+  if (!c) return null
+  return { date: candleDay(c), open: Number(c[1]), high: Number(c[2]), low: Number(c[3]), close: Number(c[4]) }
 }
 
 async function parallel<T, R>(items: T[], concurrency: number, worker: (item: T) => Promise<R>) {
@@ -173,10 +180,9 @@ export async function GET() {
 
     const cashKeys = universe.map(x => x.underlying_key!)
     const futureKeys = universe.map(x => x.instrument_key)
-    const [cashQuotes, futureQuotes, dailyOhlc] = await Promise.all([
+    const [cashQuotes, futureQuotes] = await Promise.all([
       getQuotes(cashKeys, token),
       getQuotes(futureKeys, token),
-      getDailyOhlc(cashKeys, token),
     ])
 
     const matched = universe.map(item => ({
@@ -185,12 +191,12 @@ export async function GET() {
       futureKey: clean(item.instrument_key),
       cashQuote: cashQuotes[clean(item.underlying_key)],
       futureQuote: futureQuotes[clean(item.instrument_key)],
-      previousDay: dailyOhlc[clean(item.underlying_key)]?.prev_ohlc,
-    })).filter(x => x.cashQuote?.last_price > 0 && x.futureQuote?.last_price > 0 && x.previousDay)
+    })).filter(x => x.cashQuote?.last_price > 0 && x.futureQuote?.last_price > 0)
 
     const diagnostics = {
       universe: universe.length,
       quoteMatched: matched.length,
+      previousDayMatched: 0,
       cashBars: 0,
       futuresBars: 0,
       dailyHighPass: 0,
@@ -200,13 +206,17 @@ export async function GET() {
       errors: 0,
     }
 
-    const rows = await parallel(matched, CONCURRENCY, async ({ item, cashKey, futureKey, cashQuote, futureQuote, previousDay }) => {
+    const rows = await parallel(matched, CONCURRENCY, async ({ item, cashKey, futureKey, cashQuote, futureQuote }) => {
       try {
-        const [futureBarsRaw, cashBarsRaw, historyRaw] = await Promise.all([
+        const [futureBarsRaw, cashBarsRaw, historyRaw, previousDay] = await Promise.all([
           getIntraday5m(futureKey, token),
           getIntraday5m(cashKey, token),
           getHistorical5m(futureKey, istDate(-1), fromDate, token),
+          getPreviousDay(cashKey, token),
         ])
+
+        if (!previousDay) return null
+        diagnostics.previousDayMatched++
 
         const futureBars = futureBarsRaw.filter(x => candleDay(x) === today).sort((a, b) => candleTime(a) - candleTime(b))
         const cashBars = cashBarsRaw.filter(x => candleDay(x) === today).sort((a, b) => candleTime(a) - candleTime(b))
@@ -225,15 +235,17 @@ export async function GET() {
         if (Math.abs(candleTime(currentFuture) - candleTime(currentCash)) > 5 * 60 * 1000) return null
 
         // FILTER 02 — Cash segment: ANY ONE of PDH/PDL breakout conditions.
-        const pdh = Number(previousDay!.high)
-        const pdl = Number(previousDay!.low)
+        // These are the previous completed daily candle's High/Low, matching
+        // Chartink's "1 day ago High/Low" semantics.
+        const pdh = previousDay.high
+        const pdl = previousDay.low
         const breaksHigh = Number(currentCash[2]) > pdh
         const breaksLow = Number(currentCash[3]) < pdl
         if (!breaksHigh && !breaksLow) return null
         diagnostics.cashBreakoutPass++
 
         // FILTER 01 — Futures 5M Volume > 2 × SMA(Volume,20).
-        // Current candle is included in the 20-bar SMA, matching Chartink's expression.
+        // Current candle is included in the 20-bar SMA, matching the scanner expression.
         const allFutureBars = [...historyBars, ...futureBars].sort((a, b) => candleTime(a) - candleTime(b))
         const currentIndex = allFutureBars.findIndex(x => candleTime(x) === candleTime(currentFuture))
         if (currentIndex < 19) return null
