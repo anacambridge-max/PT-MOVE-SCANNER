@@ -6,7 +6,8 @@ export const maxDuration = 60
 const V2 = 'https://api.upstox.com/v2'
 const V3 = 'https://api.upstox.com/v3'
 const MASTER = 'https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz'
-const CONCURRENCY = 8
+const CONCURRENCY = 12
+const HISTORY_CONCURRENCY = 20
 const TOP = 100
 const VOLUME_MULTIPLIER = 2
 const CPR_WIDTH_PCT = 0.5
@@ -14,7 +15,8 @@ const CPR_WIDTH_PCT = 0.5
 type I = { instrument_key:string; trading_symbol?:string; name?:string; segment?:string; instrument_type?:string; underlying_symbol?:string; underlying_key?:string; underlying_type?:string; expiry?:number|string }
 type Q = { instrument_token:string; symbol:string; last_price:number; volume?:number; net_change?:number; oi?:number }
 type C = [string,number,number,number,number,number,number]
-type O = { prev_ohlc?:{open:number;high:number;low:number;close:number;volume:number;ts:number}; live_ohlc?:{open:number;high:number;low:number;close:number;volume:number;ts:number} }
+type D = { candles?:C[] }
+type U = {item:I;cashKey:string;futureKey:string;cashQuote:Q;futureQuote:Q;prev:C|null}
 
 const clean = (x?:string|null) => x?.trim().replace('|', ':') ?? ''
 function date(offset=0){
@@ -22,7 +24,6 @@ function date(offset=0){
   const y=+p.find(x=>x.type==='year')!.value,m=+p.find(x=>x.type==='month')!.value,d=+p.find(x=>x.type==='day')!.value
   return new Date(Date.UTC(y,m-1,d+offset)).toISOString().slice(0,10)
 }
-const day=(c:C)=>new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Kolkata',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(c[0]))
 const time=(c:C)=>new Date(c[0]).getTime()
 const avg=(a:number[])=>a.length?a.reduce((x,y)=>x+y,0)/a.length:0
 function expiry(x?:number|string){
@@ -39,7 +40,6 @@ function cpr(x?:{high:number;low:number;close:number}){
   const pct=pivot?width/pivot*100:Infinity
   return {pivot,bc,tc,width,pct,pass:pct<CPR_WIDTH_PCT}
 }
-const bars=(a:C[],d:string)=>a.filter(x=>day(x)===d).sort((a,b)=>time(a)-time(b))
 
 async function api(url:string,t:string,label:string){
   for(let i=0;i<4;i++){
@@ -67,16 +67,12 @@ async function quotes(keys:string[],t:string){
   }
   return out
 }
-async function ohlc(keys:string[],t:string){
-  const out:Record<string,O>={}
-  for(let i=0;i<keys.length;i+=400){
-    const u=new URL(`${V3}/market-quote/ohlc`)
-    u.searchParams.set('instrument_key',keys.slice(i,i+400).join(','))
-    u.searchParams.set('interval','1d')
-    const d=(await api(u.toString(),t,'Daily OHLC')).data??{}
-    for(const [z,q] of Object.entries(d) as [string,O][])out[clean(z)]=q
-  }
-  return out
+async function historicalPreviousDay(key:string,toDate:string,t:string):Promise<C|null>{
+  try{
+    const d:D=await api(`${V3}/historical-candle/${encodeURIComponent(key)}/days/1/${toDate}`,t,'Previous-day history')
+    const candles=(d.data?.candles??[]).filter(x=>Array.isArray(x)&&x.length>=5).sort((a,b)=>time(a)-time(b))
+    return candles.length?candles[candles.length-1]:null
+  }catch{return null}
 }
 async function intraday(key:string,t:string){
   const d=await api(`${V3}/historical-candle/intraday/${encodeURIComponent(key)}/minutes/5`,t,'5M intraday')
@@ -92,7 +88,7 @@ export async function GET(){
   const token=process.env.UPSTOX_ANALYTICS_TOKEN
   if(!token)return NextResponse.json({ok:false,error:'UPSTOX_ANALYTICS_TOKEN is not configured'},{status:500})
   try{
-    const all=await master(),today=date()
+    const all=await master(),today=date(),previousCalendarDate=date(-1)
     const fut=all.filter(x=>x.segment==='NSE_FO'&&x.instrument_type==='FUT'&&x.underlying_type==='EQUITY'&&x.underlying_key&&x.underlying_symbol&&expiry(x.expiry)>=today)
     const near=[...new Set(fut.map(x=>expiry(x.expiry)).filter(Boolean))].sort()[0]
     const by=new Map<string,I>()
@@ -102,53 +98,50 @@ export async function GET(){
 
     const cashKeys=stocks.map(x=>x.underlying_key!)
     const futureKeys=stocks.map(x=>x.instrument_key)
-    const [cashQ,daily,futureQ]=await Promise.all([quotes(cashKeys,token),ohlc(cashKeys,token),quotes(futureKeys,token)])
+    const [cashQ,futureQ]=await Promise.all([quotes(cashKeys,token),quotes(futureKeys,token)])
+    const base=stocks.map(item=>({item,cashKey:clean(item.underlying_key),futureKey:clean(item.instrument_key),cashQuote:cashQ[clean(item.underlying_key)],futureQuote:futureQ[clean(item.instrument_key)]})).filter(x=>x.cashQuote?.last_price>0&&x.futureQuote?.last_price>0)
 
-    const universe=stocks.map(item=>({item,cashKey:clean(item.underlying_key),futureKey:clean(item.instrument_key),cashQuote:cashQ[clean(item.underlying_key)],futureQuote:futureQ[clean(item.instrument_key)],ohlc:daily[clean(item.underlying_key)]})).filter(x=>x.cashQuote?.last_price>0&&x.futureQuote?.last_price>0)
+    const historyResults=await limit(base,HISTORY_CONCURRENCY,async u=>({u,prev:await historicalPreviousDay(u.cashKey,previousCalendarDate,token)}))
+    const diagnostics={universe:stocks.length,quoteMatched:base.length,historyMatched:0,cprChecked:0,cprPass:0,dailyHighPass:0,cashBars:0,futuresBars:0,cashBreakoutPass:0,volumePass:0,finalPass:0,errors:0}
 
-    const diagnostics={universe:stocks.length,quoteMatched:universe.length,cprChecked:0,cprPass:0,dailyHighPass:0,cashBars:0,futuresBars:0,cashBreakoutPass:0,volumePass:0,finalPass:0,errors:0}
-
-    // CPR is calculated from the PREVIOUS trading day's H/L/C.
-    // This is the CPR that applies to today's session and remains fixed all day.
-    const pre=universe.filter(u=>{
-      const prev=u.ohlc?.prev_ohlc
-      if(!prev)return false
+    // Use the Historical Candle V3 API for the previous completed trading session.
+    // This avoids relying on the live OHLC snapshot's prev_ohlc field for the CPR.
+    const prepared:U[]=[]
+    for(const r of historyResults){
+      if(!r.prev)continue
+      diagnostics.historyMatched++
+      const p=r.prev
       diagnostics.cprChecked++
-      const z=cpr({high:+prev.high,low:+prev.low,close:+prev.close})
-      if(!z?.pass)return false
+      const z=cpr({high:+p[2],low:+p[3],close:+p[4]})
+      if(!z?.pass)continue
       diagnostics.cprPass++
-      return true
-    })
+      prepared.push({...r.u,prev:p})
+    }
 
-    const rows=await limit(pre,CONCURRENCY,async({item,futureKey,cashKey,cashQuote,futureQuote,ohlc})=>{
+    const rows=await limit(prepared,CONCURRENCY,async({item,futureKey,cashKey,cashQuote,futureQuote,prev})=>{
       try{
         const [fbRaw,cbRaw]=await Promise.all([intraday(futureKey,token),intraday(cashKey,token)])
-        const fb=bars(fbRaw,today),cb=bars(cbRaw,today)
+        const fb=fbRaw.sort((a,b)=>time(a)-time(b)),cb=cbRaw.sort((a,b)=>time(a)-time(b))
         diagnostics.futuresBars+=fb.length;diagnostics.cashBars+=cb.length
         if(!fb.length||!cb.length)return null
 
-        const prev=ohlc?.prev_ohlc
-        if(!prev)return null
-        const z=cpr({high:+prev.high,low:+prev.low,close:+prev.close})
+        const z=cpr({high:+prev[2],low:+prev[3],close:+prev[4]})
         if(!z?.pass)return null
 
-        // Current-day high is calculated from today's CASH 5M candles.
-        const dailyHigh=Math.max(...cb.map(x=>Number(x[2])||0))
+        const dailyHigh=Math.max(...cb.map(x=>Number(x[2])||0),Number(cashQuote.last_price)||0)
         if(!(dailyHigh>50))return null
         diagnostics.dailyHighPass++
 
         const fc=fb[fb.length-1],cc=cb[cb.length-1]
         if(Math.abs(time(fc)-time(cc))>5*60*1000)return null
 
-        // Only the breakout condition contains OR.
-        const pdh=Number(prev.high)
-        const pdl=Number(prev.low)
+        const pdh=Number(prev[2])
+        const pdl=Number(prev[3])
         const up=Number(cc[2])>pdh
         const dn=Number(cc[3])<pdl
         if(!up&&!dn)return null
         diagnostics.cashBreakoutPass++
 
-        // Current 5M volume > 2x the average of the previous 20 completed 5M futures candles.
         const completed=fb.slice(0,-1).slice(-20).map(x=>Number(x[5])||0)
         if(completed.length<20)return null
         const currentVolume=Number(fc[5])||0
@@ -175,6 +168,6 @@ export async function GET(){
     const labels=['NIFTY 50','BANK NIFTY','NIFTY MIDCAP','INDIA VIX']
     const indexes=indexKeys.map((ik,i)=>{const q=indexQ[clean(ik)];const ch=q?.last_price&&q?.net_change!=null?q.net_change/(q.last_price-q.net_change)*100:null;return{title:labels[i],value:q?.last_price??null,change:ch}})
 
-    return NextResponse.json({ok:true,source:'UPSTOX • EXACT FILTER SCANNER',timestamp:new Date().toISOString(),universeCount:stocks.length,scanned:universe.length,candidates,expiry:near,indexes,diagnostics,filter:{all:true,volumeMultiplier:2,cprWidthPct:.5,volume:'CURRENT 5M FUTURES Volume > 2 × PREVIOUS 20 COMPLETED 5M FUTURES VOLUME SMA',cash:'CURRENT 5M CASH High > Previous Day High OR CURRENT 5M CASH Low < Previous Day Low',dailyHigh:'CURRENT DAY High > 50',cpr:'PREVIOUS-DAY CPR width / Pivot < 0.5%'}})
+    return NextResponse.json({ok:true,source:'UPSTOX • EXACT FILTER SCANNER',timestamp:new Date().toISOString(),universeCount:stocks.length,scanned:base.length,candidates,expiry:near,indexes,diagnostics,filter:{all:true,volumeMultiplier:2,cprWidthPct:.5,volume:'CURRENT 5M FUTURES Volume > 2 × PREVIOUS 20 COMPLETED 5M FUTURES VOLUME SMA',cash:'CURRENT 5M CASH High > Previous Day High OR CURRENT 5M CASH Low < Previous Day Low',dailyHigh:'CURRENT DAY High > 50',cpr:'PREVIOUS COMPLETED TRADING-DAY CPR width / Pivot < 0.5%'}})
   }catch(e:any){return NextResponse.json({ok:false,error:e?.message||'Market scan failed'},{status:500})}
 }
