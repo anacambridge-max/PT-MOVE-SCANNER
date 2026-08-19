@@ -108,8 +108,8 @@ export async function GET(){
 
     const diagnostics={universe:stocks.length,quoteMatched:universe.length,cprChecked:0,cprPass:0,dailyHighPass:0,cashBars:0,futuresBars:0,cashBreakoutPass:0,volumePass:0,finalPass:0,errors:0}
 
-    // IMPORTANT: CPR is CURRENT-DAY CPR. We use today's live OHLC from Upstox,
-    // not the previous day's OHLC. This keeps the Narrow CPR filter dynamic.
+    // CURRENT-DAY CPR: use today's live OHLC from Upstox, never yesterday's OHLC.
+    // This also avoids making hundreds of 5M requests just to calculate CPR.
     const pre=universe.filter(u=>{
       const live=u.ohlc?.live_ohlc
       if(!live)return false
@@ -122,12 +122,12 @@ export async function GET(){
       return true
     })
 
-    // Exact scanner semantics from the user's Chartink filter:
+    // Exact live semantics of the user's Chartink filter:
     // 1) current 5M FUTURES volume > 2 × current 5M SMA(volume,20)
     // 2) current 5M CASH high > PDH OR current 5M CASH low < PDL
     // 3) current-day high > 50
     // 4) current-day CPR width / pivot < 0.5%
-    // All four conditions are AND; only the PDH/PDL breakout is OR.
+    // ALL four are required; only PDH/PDL is OR.
     const rows=await limit(pre,CONCURRENCY,async({item,futureKey,cashKey,cashQuote,futureQuote,ohlc})=>{
       try{
         const [fbRaw,cbRaw]=await Promise.all([intraday(futureKey,token),intraday(cashKey,token)])
@@ -140,12 +140,8 @@ export async function GET(){
         const z=cpr({high:+live.high,low:+live.low,close:+live.close})
         if(!z?.pass||!(+live.high>50))return null
 
-        // Latest available 5-minute candle on each feed. The timestamps should
-        // represent the same market candle; allow a 5-minute clock difference
-        // for minor feed lag rather than dropping valid live matches.
         const fc=fb[fb.length-1],cc=cb[cb.length-1]
-        const sameCandle=Math.abs(time(fc)-time(cc))<=5*60*1000
-        if(!sameCandle)return null
+        if(Math.abs(time(fc)-time(cc))>5*60*1000)return null
 
         const pdh=Number(ohlc?.prev_ohlc?.high)
         const pdl=Number(ohlc?.prev_ohlc?.low)
@@ -154,8 +150,6 @@ export async function GET(){
         if(!up&&!dn)return null
         diagnostics.cashBreakoutPass++
 
-        // Chartink's SMA(Volume,20) is evaluated on the current 5M candle.
-        // Therefore the current volume is included in the 20-bar average.
         const volumes=fb.slice(-20).map(x=>Number(x[5])||0)
         if(volumes.length<20)return null
         const currentVolume=Number(fc[5])||0
@@ -166,61 +160,22 @@ export async function GET(){
         diagnostics.finalPass++
 
         return {
-          rank:0,
-          symbol:item.underlying_symbol!.toUpperCase(),
-          name:item.name||item.trading_symbol||item.underlying_symbol!,
-          bias:up?'LONG':'SHORT',
-          change:Number(cashQuote.net_change??0),
-          lastPrice:cashQuote.last_price,
-          futurePrice:futureQuote.last_price,
-          rvol:+rvol.toFixed(2),
-          volume:currentVolume,
-          avgVolume20:+sma.toFixed(0),
-          breakout:up?'PDH BREAK':'PDL BREAK',
-          signalTime:cc[0],
-          score:100,
-          setup:`5M FUT VOL > 2× SMA20 + ${up?'5M HIGH > PDH':'5M LOW < PDL'} + CURRENT-DAY NARROW CPR`,
-          cprWidth:+z.pct.toFixed(3),
-          dailyHigh:+live.high.toFixed(2),
-          prevDayHigh:pdh,
-          prevDayLow:pdl,
-          conditions:{futuresVolume:true,cashBreakout:true,dailyHighAbove50:true,narrowCPR:true}
+          rank:0,symbol:item.underlying_symbol!.toUpperCase(),name:item.name||item.trading_symbol||item.underlying_symbol!,
+          bias:up?'LONG':'SHORT',change:Number(cashQuote.net_change??0),lastPrice:cashQuote.last_price,futurePrice:futureQuote.last_price,
+          rvol:+rvol.toFixed(2),volume:currentVolume,avgVolume20:+sma.toFixed(0),breakout:up?'PDH BREAK':'PDL BREAK',signalTime:cc[0],score:100,
+          setup:`5M FUT VOL > 2× SMA20 + ${up?'5M HIGH > PDH':'5M LOW < PDL'} + CURRENT-DAY NARROW CPR`,cprWidth:+z.pct.toFixed(3),dailyHigh:+live.high.toFixed(2),
+          prevDayHigh:pdh,prevDayLow:pdl,conditions:{futuresVolume:true,cashBreakout:true,dailyHighAbove50:true,narrowCPR:true}
         }
       }catch{diagnostics.errors++;return null}
     })
 
-    const candidates=rows.filter(Boolean).sort((a:any,b:any)=>time([b.signalTime]) - time([a.signalTime])).slice(0,TOP).map((x:any,i)=>({...x,rank:i+1}))
+    const candidates=rows.filter(Boolean).sort((a:any,b:any)=>new Date(b.signalTime).getTime()-new Date(a.signalTime).getTime()).slice(0,TOP).map((x:any,i)=>({...x,rank:i+1}))
 
     const indexKeys=['NSE_INDEX|Nifty 50','NSE_INDEX|Nifty Bank','NSE_INDEX|Nifty Midcap 100','NSE_INDEX|India VIX']
     const indexQ=await quotes(indexKeys,token)
     const labels=['NIFTY 50','BANK NIFTY','NIFTY MIDCAP','INDIA VIX']
-    const indexes=indexKeys.map((ik,i)=>{
-      const q=indexQ[clean(ik)]
-      const ch=q?.last_price&&q?.net_change!=null?q.net_change/(q.last_price-q.net_change)*100:null
-      return{title:labels[i],value:q?.last_price??null,change:ch}
-    })
+    const indexes=indexKeys.map((ik,i)=>{const q=indexQ[clean(ik)];const ch=q?.last_price&&q?.net_change!=null?q.net_change/(q.last_price-q.net_change)*100:null;return{title:labels[i],value:q?.last_price??null,change:ch}})
 
-    return NextResponse.json({
-      ok:true,
-      source:'UPSTOX • EXACT FILTER SCANNER',
-      timestamp:new Date().toISOString(),
-      universeCount:stocks.length,
-      scanned:universe.length,
-      candidates,
-      expiry:near,
-      indexes,
-      diagnostics,
-      filter:{
-        all:true,
-        volumeMultiplier:2,
-        cprWidthPct:.5,
-        volume:'CURRENT 5M FUTURES Volume > 2 × CURRENT 5M SMA(Volume,20)',
-        cash:'CURRENT 5M CASH High > Previous Day High OR CURRENT 5M CASH Low < Previous Day Low',
-        dailyHigh:'CURRENT DAY High > 50',
-        cpr:'CURRENT-DAY CPR width / Pivot < 0.5%'
-      }
-    })
-  }catch(e:any){
-    return NextResponse.json({ok:false,error:e?.message||'Market scan failed'},{status:500})
-  }
+    return NextResponse.json({ok:true,source:'UPSTOX • EXACT FILTER SCANNER',timestamp:new Date().toISOString(),universeCount:stocks.length,scanned:universe.length,candidates,expiry:near,indexes,diagnostics,filter:{all:true,volumeMultiplier:2,cprWidthPct:.5,volume:'CURRENT 5M FUTURES Volume > 2 × CURRENT 5M SMA(Volume,20)',cash:'CURRENT 5M CASH High > Previous Day High OR CURRENT 5M CASH Low < Previous Day Low',dailyHigh:'CURRENT DAY High > 50',cpr:'CURRENT-DAY CPR width / Pivot < 0.5%'}})
+  }catch(e:any){return NextResponse.json({ok:false,error:e?.message||'Market scan failed'},{status:500})}
 }
