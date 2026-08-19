@@ -108,8 +108,8 @@ export async function GET(){
 
     const diagnostics={universe:stocks.length,quoteMatched:universe.length,cprChecked:0,cprPass:0,dailyHighPass:0,cashBars:0,futuresBars:0,cashBreakoutPass:0,volumePass:0,finalPass:0,errors:0}
 
-    // IMPORTANT FIX: the screenshot's filter is PREVIOUS-DAY narrow CPR.
-    // Do not use today's evolving H/L/C for the CPR filter.
+    // CPR is calculated from the PREVIOUS trading day's H/L/C.
+    // This is the CPR that applies to today's session and remains fixed all day.
     const pre=universe.filter(u=>{
       const prev=u.ohlc?.prev_ohlc
       if(!prev)return false
@@ -117,8 +117,6 @@ export async function GET(){
       const z=cpr({high:+prev.high,low:+prev.low,close:+prev.close})
       if(!z?.pass)return false
       diagnostics.cprPass++
-      if(!(+prev.high>0))return false
-      diagnostics.dailyHighPass++
       return true
     })
 
@@ -134,9 +132,15 @@ export async function GET(){
         const z=cpr({high:+prev.high,low:+prev.low,close:+prev.close})
         if(!z?.pass)return null
 
+        // Current-day high is calculated from today's CASH 5M candles.
+        const dailyHigh=Math.max(...cb.map(x=>Number(x[2])||0))
+        if(!(dailyHigh>50))return null
+        diagnostics.dailyHighPass++
+
         const fc=fb[fb.length-1],cc=cb[cb.length-1]
         if(Math.abs(time(fc)-time(cc))>5*60*1000)return null
 
+        // Only the breakout condition contains OR.
         const pdh=Number(prev.high)
         const pdl=Number(prev.low)
         const up=Number(cc[2])>pdh
@@ -144,8 +148,7 @@ export async function GET(){
         if(!up&&!dn)return null
         diagnostics.cashBreakoutPass++
 
-        // Use the previous 20 completed futures candles as the baseline.
-        // This avoids diluting RVOL/SMA20 with the current breakout candle itself.
+        // Current 5M volume > 2x the average of the previous 20 completed 5M futures candles.
         const completed=fb.slice(0,-1).slice(-20).map(x=>Number(x[5])||0)
         if(completed.length<20)return null
         const currentVolume=Number(fc[5])||0
@@ -155,15 +158,11 @@ export async function GET(){
         diagnostics.volumePass++
         diagnostics.finalPass++
 
-        const dailyHigh=Math.max(...cb.map(x=>Number(x[2])||0),Number(cashQuote.last_price)||0)
-        if(!(dailyHigh>50))return null
-        diagnostics.dailyHighPass++
-
         return {
           rank:0,symbol:item.underlying_symbol!.toUpperCase(),name:item.name||item.trading_symbol||item.underlying_symbol!,
           bias:up?'LONG':'SHORT',change:Number(cashQuote.net_change??0),lastPrice:cashQuote.last_price,futurePrice:futureQuote.last_price,
           rvol:+rvol.toFixed(2),volume:currentVolume,avgVolume20:+sma.toFixed(0),breakout:up?'PDH BREAK':'PDL BREAK',signalTime:cc[0],score:100,
-          setup:`5M FUT VOL > 2× SMA20 + ${up?'5M HIGH > PDH':'5M LOW < PDL'} + PREVIOUS-DAY NARROW CPR`,cprWidth:+z.pct.toFixed(3),dailyHigh:+dailyHigh.toFixed(2),
+          setup:`5M FUT VOL > 2× SMA20 + ${up?'5M HIGH > PDH':'5M LOW < PDL'} + CURRENT-DAY HIGH > 50 + PREVIOUS-DAY NARROW CPR`,cprWidth:+z.pct.toFixed(3),dailyHigh:+dailyHigh.toFixed(2),
           prevDayHigh:pdh,prevDayLow:pdl,conditions:{futuresVolume:true,cashBreakout:true,dailyHighAbove50:true,narrowCPR:true}
         }
       }catch{diagnostics.errors++;return null}
