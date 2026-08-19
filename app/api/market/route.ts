@@ -7,7 +7,7 @@ const V2 = 'https://api.upstox.com/v2'
 const V3 = 'https://api.upstox.com/v3'
 const MASTER = 'https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz'
 const CONCURRENCY = 12
-const HISTORY_CONCURRENCY = 20
+const HISTORY_CONCURRENCY = 8
 const TOP = 100
 const VOLUME_MULTIPLIER = 2
 const CPR_WIDTH_PCT = 0.5
@@ -24,6 +24,7 @@ function date(offset=0){
   const y=+p.find(x=>x.type==='year')!.value,m=+p.find(x=>x.type==='month')!.value,d=+p.find(x=>x.type==='day')!.value
   return new Date(Date.UTC(y,m-1,d+offset)).toISOString().slice(0,10)
 }
+const candleDate=(c:C)=>new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Kolkata',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(c[0]))
 const time=(c:C)=>new Date(c[0]).getTime()
 const avg=(a:number[])=>a.length?a.reduce((x,y)=>x+y,0)/a.length:0
 function expiry(x?:number|string){
@@ -67,12 +68,21 @@ async function quotes(keys:string[],t:string){
   }
   return out
 }
-async function historicalPreviousDay(key:string,toDate:string,t:string):Promise<C|null>{
+async function historicalPreviousDay(key:string,today:string,t:string):Promise<C|null>{
+  // Ask for a range ending today, then explicitly choose the newest candle
+  // whose IST trading date is before today. This handles weekends/holidays.
+  const from=date(-10)
   try{
-    const d:D=await api(`${V3}/historical-candle/${encodeURIComponent(key)}/days/1/${toDate}`,t,'Previous-day history')
-    const candles=(d.data?.candles??[]).filter(x=>Array.isArray(x)&&x.length>=5).sort((a,b)=>time(a)-time(b))
-    return candles.length?candles[candles.length-1]:null
-  }catch{return null}
+    const d:D=await api(`${V3}/historical-candle/${encodeURIComponent(key)}/days/1/${today}/${from}`,t,'Previous-day history V3')
+    const candles=(d.data?.candles??[]).filter(x=>Array.isArray(x)&&x.length>=5&&candleDate(x)<today).sort((a,b)=>time(a)-time(b))
+    if(candles.length)return candles[candles.length-1]
+  }catch{}
+  try{
+    const d:D=await api(`${V2}/historical-candle/${encodeURIComponent(key)}/day/${today}/${from}`,t,'Previous-day history V2')
+    const candles=(d.data?.candles??[]).filter(x=>Array.isArray(x)&&x.length>=5&&candleDate(x)<today).sort((a,b)=>time(a)-time(b))
+    if(candles.length)return candles[candles.length-1]
+  }catch{}
+  return null
 }
 async function intraday(key:string,t:string){
   const d=await api(`${V3}/historical-candle/intraday/${encodeURIComponent(key)}/minutes/5`,t,'5M intraday')
@@ -88,7 +98,7 @@ export async function GET(){
   const token=process.env.UPSTOX_ANALYTICS_TOKEN
   if(!token)return NextResponse.json({ok:false,error:'UPSTOX_ANALYTICS_TOKEN is not configured'},{status:500})
   try{
-    const all=await master(),today=date(),previousCalendarDate=date(-1)
+    const all=await master(),today=date()
     const fut=all.filter(x=>x.segment==='NSE_FO'&&x.instrument_type==='FUT'&&x.underlying_type==='EQUITY'&&x.underlying_key&&x.underlying_symbol&&expiry(x.expiry)>=today)
     const near=[...new Set(fut.map(x=>expiry(x.expiry)).filter(Boolean))].sort()[0]
     const by=new Map<string,I>()
@@ -101,11 +111,9 @@ export async function GET(){
     const [cashQ,futureQ]=await Promise.all([quotes(cashKeys,token),quotes(futureKeys,token)])
     const base=stocks.map(item=>({item,cashKey:clean(item.underlying_key),futureKey:clean(item.instrument_key),cashQuote:cashQ[clean(item.underlying_key)],futureQuote:futureQ[clean(item.instrument_key)]})).filter(x=>x.cashQuote?.last_price>0&&x.futureQuote?.last_price>0)
 
-    const historyResults=await limit(base,HISTORY_CONCURRENCY,async u=>({u,prev:await historicalPreviousDay(u.cashKey,previousCalendarDate,token)}))
+    const historyResults=await limit(base,HISTORY_CONCURRENCY,async u=>({u,prev:await historicalPreviousDay(u.cashKey,today,token)}))
     const diagnostics={universe:stocks.length,quoteMatched:base.length,historyMatched:0,cprChecked:0,cprPass:0,dailyHighPass:0,cashBars:0,futuresBars:0,cashBreakoutPass:0,volumePass:0,finalPass:0,errors:0}
 
-    // Use the Historical Candle V3 API for the previous completed trading session.
-    // This avoids relying on the live OHLC snapshot's prev_ohlc field for the CPR.
     const prepared:U[]=[]
     for(const r of historyResults){
       if(!r.prev)continue
