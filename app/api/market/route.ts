@@ -6,13 +6,14 @@ export const maxDuration = 60
 const V2 = 'https://api.upstox.com/v2'
 const V3 = 'https://api.upstox.com/v3'
 const MASTER = 'https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz'
-const CONCURRENCY = 12
+const CONCURRENCY = 8
 const TOP = 100
 const VOLUME_MULTIPLIER = 2
 
 type I = { instrument_key:string; trading_symbol?:string; name?:string; segment?:string; instrument_type?:string; underlying_symbol?:string; underlying_key?:string; underlying_type?:string; expiry?:number|string }
 type Q = { instrument_token:string; symbol:string; last_price:number; volume?:number; net_change?:number; oi?:number }
 type C = [string,number,number,number,number,number,number]
+type O = { prev_ohlc?:{open:number;high:number;low:number;close:number;volume:number;ts:number} }
 
 const clean = (x?:string|null) => x?.trim().replace('|', ':') ?? ''
 function date(offset=0){
@@ -55,6 +56,17 @@ async function quotes(keys:string[],t:string){
   }
   return out
 }
+async function dailyOhlc(keys:string[],t:string){
+  const out:Record<string,O>={}
+  for(let i=0;i<keys.length;i+=400){
+    const u=new URL(`${V3}/market-quote/ohlc`)
+    u.searchParams.set('instrument_key',keys.slice(i,i+400).join(','))
+    u.searchParams.set('interval','1d')
+    const d=(await api(u.toString(),t,'Daily OHLC')).data??{}
+    for(const [z,q] of Object.entries(d) as [string,O][])out[clean(z)]=q
+  }
+  return out
+}
 async function intraday(key:string,t:string){
   const d=await api(`${V3}/historical-candle/intraday/${encodeURIComponent(key)}/minutes/5`,t,'5M intraday')
   return (d.data?.candles??[]) as C[]
@@ -79,12 +91,12 @@ export async function GET(){
 
     const cashKeys=stocks.map(x=>x.underlying_key!)
     const futureKeys=stocks.map(x=>x.instrument_key)
-    const [cashQ,futureQ]=await Promise.all([quotes(cashKeys,token),quotes(futureKeys,token)])
-    const universe=stocks.map(item=>({item,cashKey:clean(item.underlying_key),futureKey:clean(item.instrument_key),cashQuote:cashQ[clean(item.underlying_key)],futureQuote:futureQ[clean(item.instrument_key)]})).filter(x=>x.cashQuote?.last_price>0&&x.futureQuote?.last_price>0)
+    const [cashQ,futureQ,daily]=await Promise.all([quotes(cashKeys,token),quotes(futureKeys,token),dailyOhlc(cashKeys,token)])
+    const universe=stocks.map(item=>({item,cashKey:clean(item.underlying_key),futureKey:clean(item.instrument_key),cashQuote:cashQ[clean(item.underlying_key)],futureQuote:futureQ[clean(item.instrument_key)],prev:daily[clean(item.underlying_key)]?.prev_ohlc})).filter(x=>x.cashQuote?.last_price>0&&x.futureQuote?.last_price>0&&x.prev)
 
     const diagnostics={universe:stocks.length,quoteMatched:universe.length,cashBars:0,futuresBars:0,dailyHighPass:0,cashBreakoutPass:0,volumePass:0,finalPass:0,errors:0}
 
-    const rows=await limit(universe,CONCURRENCY,async({item,futureKey,cashKey,cashQuote,futureQuote})=>{
+    const rows=await limit(universe,CONCURRENCY,async({item,futureKey,cashKey,cashQuote,futureQuote,prev})=>{
       try{
         const [fbRaw,cbRaw]=await Promise.all([intraday(futureKey,token),intraday(cashKey,token)])
         const fb=fbRaw.filter(x=>day(x)===today).sort((a,b)=>time(a)-time(b))
@@ -101,15 +113,6 @@ export async function GET(){
         if(Math.abs(time(fc)-time(cc))>5*60*1000)return null
 
         // Filter 2: current 5M cash candle breaks previous trading day's high/low.
-        // The daily OHLC quote's prev_ohlc is intentionally not used here; derive
-        // the previous-day levels from the last daily candle returned by V2 OHLC.
-        const pd=new URL(`${V2}/market-quote/ohlc`)
-        pd.searchParams.set('instrument_key',cashKey)
-        pd.searchParams.set('interval','1d')
-        const daily=(await api(pd.toString(),token,'Daily OHLC')).data??{}
-        const raw=Object.values(daily)[0] as any
-        const prev=raw?.prev_ohlc
-        if(!prev)return null
         const pdh=Number(prev.high),pdl=Number(prev.low)
         const up=Number(cc[2])>pdh
         const dn=Number(cc[3])<pdl
