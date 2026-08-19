@@ -194,7 +194,7 @@ export async function GET(){
         const baseLevels=levelsFromHistory(weekly,monthly,today)
         const f=scanOne(session,history,pdh,pdl,baseLevels,quote,today)
         if(!f)return null
-        const score=Math.min(100,Math.max(f.score,Math.round(60+Math.min(25,(f.vr-EXTREME_RVOL)*7))))
+        const score=f.score
         return{
           rank:0,symbol:item.underlying_symbol!.toUpperCase(),name:item.name||item.trading_symbol||item.underlying_symbol!,sector:'F&O',score,bias:f.direction,change:Number(quote.net_change??0),volume:(quote.volume??0).toLocaleString('en-IN'),rs:'Neutral',
           setup:`${f.trigger} + EXT VOL ${f.vr.toFixed(2)}× + ${f.pdBreak} ${f.direction==='LONG'?'BREAKOUT':'BREAKDOWN'}`,
