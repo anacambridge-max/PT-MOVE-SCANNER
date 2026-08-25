@@ -51,49 +51,60 @@ export async function GET(){
   const stocks=[...by.values()].slice(0,MAX_STOCKS);if(!stocks.length)throw Error('NSE F&O universe is empty')
   const cashKeys=stocks.map(x=>x.underlying_key!),futureKeys=stocks.map(x=>x.instrument_key)
   const [cq,fq,pd]=await Promise.all([quotes(cashKeys,token),quotes(futureKeys,token),daily(cashKeys,token)])
-  const universe=stocks.map(item=>{const ck=clean(item.underlying_key),fk=clean(item.instrument_key);return{item,ck,fk,cash:cq[ck]||cq[item.underlying_symbol!.toUpperCase()],future:fq[fk]||fq[(item.trading_symbol||'').toUpperCase()],prev:pd[ck]?.prev_ohlc}}).filter(x=>x.cash?.last_price>0&&x.future?.last_price>0&&x.prev)
-  const diagnostics={universe:stocks.length,quoteMatched:universe.length,cashBars:0,futuresBars:0,dailyHighPass:0,cashBreakoutPass:0,volumePass:0,finalPass:0,errors:0}
+
+  // IMPORTANT: keep the original Upstox instrument key (with '|') for API calls.
+  // Only normalize keys when looking up keys returned by quote/OHLC APIs.
+  const universe=stocks.map(item=>{
+    const ck=item.underlying_key!
+    const fk=item.instrument_key
+    return{item,ck,fk,cash:cq[clean(ck)]||cq[item.underlying_symbol!.toUpperCase()],future:fq[clean(fk)]||fq[(item.trading_symbol||'').toUpperCase()],prev:pd[clean(ck)]?.prev_ohlc}
+  }).filter(x=>x.cash?.last_price>0&&x.future?.last_price>0&&x.prev)
+  const diagnostics={universe:stocks.length,quoteMatched:universe.length,previousDayMatched:universe.length,cashBars:0,futuresBars:0,dailyHighPass:0,cashBreakoutPass:0,volumePass:0,finalPass:0,errors:0}
 
   // Filter 1+2+3 are evaluated on the same 5-minute timestamp:
-  // FUTURES current 5M volume > 2x previous-20 5M volume SMA
+  // FUTURES current 5M volume > 2x previous-20 completed 5M volume SMA
   // CASH current 5M high > previous-day high OR current 5M low < previous-day low
   // CURRENT-DAY cash high > 50
   const cashHits=await limit(universe,CONCURRENCY,async x=>{
-   const bars=(await intra(x.ck,token)).filter(c=>day(c)===today&&hm(c)>=START).sort((a,b)=>ts(a)-ts(b));
-   diagnostics.cashBars+=bars.length
-   if(!bars.length)return null
-   let dayHigh=0
-   const hits:any[]=[]
-   for(const c of bars){
-     dayHigh=Math.max(dayHigh,Number(c[2])||0)
-     if(dayHigh<=50)continue
-     diagnostics.dailyHighPass++
-     const up=Number(c[2])>Number(x.prev!.high),dn=Number(c[3])<Number(x.prev!.low)
-     if(up||dn){diagnostics.cashBreakoutPass++;hits.push({c,up,dn,dayHigh})}
-   }
-   return hits.length?{...x,hits}:null
+   try{
+    const bars=(await intra(x.ck,token)).filter(c=>day(c)===today&&hm(c)>=START).sort((a,b)=>ts(a)-ts(b))
+    diagnostics.cashBars+=bars.length
+    if(!bars.length)return null
+    let dayHigh=0
+    const hits:any[]=[]
+    for(const c of bars){
+      dayHigh=Math.max(dayHigh,Number(c[2])||0)
+      if(dayHigh<=50)continue
+      diagnostics.dailyHighPass++
+      const up=Number(c[2])>Number(x.prev!.high),dn=Number(c[3])<Number(x.prev!.low)
+      if(up||dn){diagnostics.cashBreakoutPass++;hits.push({c,up,dn,dayHigh})}
+    }
+    return hits.length?{...x,hits}:null
+   }catch{diagnostics.errors++;return null}
   })
   const candidatesCash=cashHits.filter(Boolean) as any[]
 
   const rows=await limit(candidatesCash,CONCURRENCY,async x=>{
-   const [fbRaw,hRaw]=await Promise.all([intra(x.fk,token),hist(x.fk,token)])
-   const fb=fbRaw.filter(c=>day(c)===today&&hm(c)>=START).sort((a,b)=>ts(a)-ts(b))
-   diagnostics.futuresBars+=fb.length
-   if(!fb.length)return null
-   const allF=[...hRaw.filter(c=>day(c)!==today),...fb].sort((a,b)=>ts(a)-ts(b))
-   const fBy=new Map(fb.map(c=>[ts(c),c]))
-   const qualified:any[]=[]
-   for(const h of x.hits){
-     const f=fBy.get(ts(h.c));if(!f)continue
-     const idx=allF.findIndex(c=>ts(c)===ts(f));if(idx<20)continue
-     const previous20=allF.slice(idx-20,idx).map(c=>Number(c[5])||0)
-     const sma=avg(previous20),vol=Number(f[5])||0
-     if(sma>0&&vol>sma*MULT)qualified.push({f,h,rvol:vol/sma,sma})
-   }
-   if(!qualified.length)return null
-   diagnostics.volumePass+=qualified.length;diagnostics.finalPass++
-   const hit=qualified[qualified.length-1]
-   return {rank:0,symbol:x.item.underlying_symbol!.toUpperCase(),name:x.item.name||x.item.trading_symbol||x.item.underlying_symbol!,bias:hit.h.up?'LONG':'SHORT',change:Number(x.cash.net_change??0),lastPrice:Number(x.cash.last_price),futurePrice:Number(x.future.last_price),rvol:+hit.rvol.toFixed(2),volume:Number(hit.f[5])||0,avgVolume20:Math.round(hit.sma),breakout:hit.h.up?'PDH BREAK':'PDL BREAK',signalTime:hit.h.c[0],score:100,setup:`TODAY 09:15+ • 5M FUTURES VOLUME > 2× SMA(20) + ${hit.h.up?'5M HIGH > 1 DAY AGO HIGH':'5M LOW < 1 DAY AGO LOW'} + CURRENT DAY HIGH > 50`,dailyHigh:+hit.h.dayHigh.toFixed(2),prevDayHigh:Number(x.prev.high),prevDayLow:Number(x.prev.low),conditions:{futuresVolume:true,cashBreakout:true,dailyHighAbove50:true}}
+   try{
+    const [fbRaw,hRaw]=await Promise.all([intra(x.fk,token),hist(x.fk,token)])
+    const fb=fbRaw.filter(c=>day(c)===today&&hm(c)>=START).sort((a,b)=>ts(a)-ts(b))
+    diagnostics.futuresBars+=fb.length
+    if(!fb.length)return null
+    const allF=[...hRaw.filter(c=>day(c)!==today),...fb].sort((a,b)=>ts(a)-ts(b))
+    const fBy=new Map(fb.map(c=>[ts(c),c]))
+    const qualified:any[]=[]
+    for(const h of x.hits){
+      const f=fBy.get(ts(h.c));if(!f)continue
+      const idx=allF.findIndex(c=>ts(c)===ts(f));if(idx<20)continue
+      const previous20=allF.slice(idx-20,idx).map(c=>Number(c[5])||0)
+      const sma=avg(previous20),vol=Number(f[5])||0
+      if(sma>0&&vol>sma*MULT)qualified.push({f,h,rvol:vol/sma,sma})
+    }
+    if(!qualified.length)return null
+    diagnostics.volumePass+=qualified.length;diagnostics.finalPass++
+    const hit=qualified[qualified.length-1]
+    return {rank:0,symbol:x.item.underlying_symbol!.toUpperCase(),name:x.item.name||x.item.trading_symbol||x.item.underlying_symbol!,bias:hit.h.up?'LONG':'SHORT',change:Number(x.cash.net_change??0),lastPrice:Number(x.cash.last_price),futurePrice:Number(x.future.last_price),rvol:+hit.rvol.toFixed(2),volume:Number(hit.f[5])||0,avgVolume20:Math.round(hit.sma),breakout:hit.h.up?'PDH BREAK':'PDL BREAK',signalTime:hit.h.c[0],score:100,setup:`TODAY 09:15+ • 5M FUTURES VOLUME > 2× SMA(20) + ${hit.h.up?'5M HIGH > 1 DAY AGO HIGH':'5M LOW < 1 DAY AGO LOW'} + CURRENT DAY HIGH > 50`,dailyHigh:+hit.h.dayHigh.toFixed(2),prevDayHigh:Number(x.prev.high),prevDayLow:Number(x.prev.low),conditions:{futuresVolume:true,cashBreakout:true,dailyHighAbove50:true}}
+   }catch{diagnostics.errors++;return null}
   })
 
   const candidates=rows.filter(Boolean).sort((a:any,b:any)=>new Date(b.signalTime).getTime()-new Date(a.signalTime).getTime()).slice(0,TOP).map((x:any,i)=>({...x,rank:i+1}))
