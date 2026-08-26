@@ -9,7 +9,7 @@ const CONCURRENCY=15,TOP=100,MULT=2,START='09:15',MAX_STOCKS=300
 type I={instrument_key:string;trading_symbol?:string;name?:string;segment?:string;instrument_type?:string;underlying_symbol?:string;underlying_key?:string;underlying_type?:string;expiry?:number|string}
 type Q={instrument_token?:string;symbol?:string;last_price:number;net_change?:number}
 type C=[string,number,number,number,number,number,number]
-type O={prev_ohlc?:{open:number;high:number;low:number;close:number;volume:number;ts:number}}
+type O={instrument_token?:string;symbol?:string;last_price?:number;prev_ohlc?:{open:number;high:number;low:number;close:number;volume:number;ts:number}}
 const clean=(x?:string|null)=>x?.trim().replace('|',':')??''
 const ts=(c:C)=>new Date(c[0]).getTime()
 function date(off=0){const p=new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Kolkata',year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(new Date());const y=+p.find(x=>x.type==='year')!.value,m=+p.find(x=>x.type==='month')!.value,d=+p.find(x=>x.type==='day')!.value;return new Date(Date.UTC(y,m-1,d+off)).toISOString().slice(0,10)}
@@ -35,7 +35,7 @@ async function api(url:string,token:string,label:string){
 
 async function master(){const r=await fetch(MASTER,{cache:'no-store'});if(!r.ok)throw Error(`Instrument master failed: ${r.status}`);const b=Buffer.from(await r.arrayBuffer());let s='';try{s=gunzipSync(b).toString()}catch{s=b.toString()}return JSON.parse(s) as I[]}
 async function quotes(keys:string[],token:string){const out:Record<string,Q>={};for(let i=0;i<keys.length;i+=400){const u=new URL(`${V2}/market-quote/quotes`);u.searchParams.set('instrument_key',keys.slice(i,i+400).join(','));const d=(await api(u.toString(),token,'Quotes')).data??{};for(const [k,q] of Object.entries(d) as [string,Q][]) {out[clean(k)]=q;if(q.instrument_token)out[clean(q.instrument_token)]=q;if(q.symbol)out[q.symbol.toUpperCase()]=q}}return out}
-async function daily(keys:string[],token:string){const out:Record<string,O>={};for(let i=0;i<keys.length;i+=400){const u=new URL(`${V3}/market-quote/ohlc`);u.searchParams.set('instrument_key',keys.slice(i,i+400).join(','));u.searchParams.set('interval','1d');const d=(await api(u.toString(),token,'Daily OHLC')).data??{};for(const [k,q] of Object.entries(d) as [string,O][])out[clean(k)]=q}return out}
+async function daily(keys:string[],token:string){const out:Record<string,O>={};for(let i=0;i<keys.length;i+=400){const u=new URL(`${V3}/market-quote/ohlc`);u.searchParams.set('instrument_key',keys.slice(i,i+400).join(','));u.searchParams.set('interval','1d');const d=(await api(u.toString(),token,'Daily OHLC')).data??{};for(const [k,q] of Object.entries(d) as [string,O][]) {out[clean(k)]=q;if(q.instrument_token)out[clean(q.instrument_token)]=q;if(q.symbol)out[q.symbol.toUpperCase()]=q}}return out}
 async function intra(key:string,token:string){const d=await api(`${V3}/historical-candle/intraday/${encodeURIComponent(key)}/minutes/5`,token,'5M intraday');return (d.data?.candles??[]) as C[]}
 async function hist(key:string,token:string){const d=await api(`${V3}/historical-candle/${encodeURIComponent(key)}/minutes/5/${date(-1)}/${date(-7)}`,token,'5M history');return (d.data?.candles??[]) as C[]}
 async function limit<T,R>(a:T[],n:number,fn:(x:T)=>Promise<R>){const out:(R|undefined)[]=new Array(a.length);let i=0;async function w(){while(true){const j=i++;if(j>=a.length)return;try{out[j]=await fn(a[j])}catch{out[j]=undefined}}}await Promise.all(Array.from({length:Math.min(n,a.length)},w));return out}
@@ -52,19 +52,17 @@ export async function GET(){
   const cashKeys=stocks.map(x=>x.underlying_key!),futureKeys=stocks.map(x=>x.instrument_key)
   const [cq,fq,pd]=await Promise.all([quotes(cashKeys,token),quotes(futureKeys,token),daily(cashKeys,token)])
 
-  // IMPORTANT: keep the original Upstox instrument key (with '|') for API calls.
-  // Only normalize keys when looking up keys returned by quote/OHLC APIs.
+  // Upstox quote/OHLC response objects commonly use a display key such as NSE_EQ:SYMBOL,
+  // while instrument_token contains the original NSE_EQ|... key. Both are indexed above.
+  // Keep the original | key for all historical-candle API calls.
   const universe=stocks.map(item=>{
     const ck=item.underlying_key!
     const fk=item.instrument_key
-    return{item,ck,fk,cash:cq[clean(ck)]||cq[item.underlying_symbol!.toUpperCase()],future:fq[clean(fk)]||fq[(item.trading_symbol||'').toUpperCase()],prev:pd[clean(ck)]?.prev_ohlc}
+    const symbol=(item.underlying_symbol||item.trading_symbol||'').toUpperCase()
+    return{item,ck,fk,cash:cq[clean(ck)]||cq[symbol],future:fq[clean(fk)]||fq[(item.trading_symbol||'').toUpperCase()],prev:pd[clean(ck)]?.prev_ohlc||pd[symbol]?.prev_ohlc}
   }).filter(x=>x.cash?.last_price>0&&x.future?.last_price>0&&x.prev)
-  const diagnostics={universe:stocks.length,quoteMatched:universe.length,previousDayMatched:universe.length,cashBars:0,futuresBars:0,dailyHighPass:0,cashBreakoutPass:0,volumePass:0,finalPass:0,errors:0}
+  const diagnostics={universe:stocks.length,quoteMatched:universe.length,previousDayMatched:universe.filter(x=>!!x.prev).length,cashBars:0,futuresBars:0,dailyHighPass:0,cashBreakoutPass:0,volumePass:0,finalPass:0,errors:0}
 
-  // Filter 1+2+3 are evaluated on the same 5-minute timestamp:
-  // FUTURES current 5M volume > 2x previous-20 completed 5M volume SMA
-  // CASH current 5M high > previous-day high OR current 5M low < previous-day low
-  // CURRENT-DAY cash high > 50
   const cashHits=await limit(universe,CONCURRENCY,async x=>{
    try{
     const bars=(await intra(x.ck,token)).filter(c=>day(c)===today&&hm(c)>=START).sort((a,b)=>ts(a)-ts(b))
